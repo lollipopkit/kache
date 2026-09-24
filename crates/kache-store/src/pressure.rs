@@ -55,6 +55,14 @@ pub(crate) fn recorded_unreclaimable(cache_dir: &Path, now: u64) -> u64 {
         .map_or(0, |record| bytes_if_current(record, now))
 }
 
+/// Drop the measurement once blobs it may count are gone: a removal that
+/// unlinked blobs, a cleared store, a rewritten blob index. Kept, it would
+/// go on subtracting their bytes from a store that no longer holds them and
+/// hide real pressure until it expired. The next size sweep measures again.
+pub(crate) fn forget_unreclaimable(cache_dir: &Path) {
+    let _ = std::fs::remove_file(record_path(cache_dir));
+}
+
 /// Store a size sweep's measurement. The caller holds `gc.lock`. A failed
 /// write only costs the next trigger its correction.
 pub(crate) fn record_unreclaimable(cache_dir: &Path, bytes: u64, now: u64) {
@@ -116,6 +124,10 @@ mod tests {
 
         record_unreclaimable(dir.path(), 0, NOW);
         assert_eq!(recorded_unreclaimable(dir.path(), NOW), 0, "replaced");
+
+        record_unreclaimable(dir.path(), 4096, NOW);
+        forget_unreclaimable(dir.path());
+        assert_eq!(recorded_unreclaimable(dir.path(), NOW), 0, "forgotten");
 
         std::fs::write(record_path(dir.path()), b"not json").unwrap();
         assert_eq!(recorded_unreclaimable(dir.path(), NOW), 0, "corrupt");

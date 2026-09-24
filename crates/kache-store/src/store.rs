@@ -3408,6 +3408,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         match result {
             Ok(drift) => {
                 self.db.execute_batch("COMMIT")?;
+                if drift.total() > 0 {
+                    crate::pressure::forget_unreclaimable(&self.config.cache_dir);
+                }
                 Ok(drift)
             }
             Err(error) => {
@@ -4804,10 +4807,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // unreachable and the walk evicted every freeable entry (#1206).
         let mut unreclaimable = self.measure_unreclaimable()?;
         let measured_entries = unreclaimable.keys.len();
-        let measured_bytes = unreclaimable.bytes();
-        let now = crate::pressure::unix_now_secs();
-        crate::pressure::record_unreclaimable(&self.config.cache_dir, measured_bytes, now);
-        let pressure = physical.saturating_sub(measured_bytes);
+        let pressure = physical.saturating_sub(unreclaimable.bytes());
         let mut stats = if crate::eviction::over_eviction_trigger(pressure, self.config.max_size) {
             // The ranking is computed once and walked while deleting: each
             // entry's score is independent of the others, so the order
@@ -4827,14 +4827,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         } else {
             GcStats::default()
         };
-        // Refusals during the walk add to what was measured.
-        if unreclaimable.bytes() != measured_bytes {
-            crate::pressure::record_unreclaimable(
-                &self.config.cache_dir,
-                unreclaimable.bytes(),
-                now,
-            );
-        }
+        // Recorded after the walk: its removals drop any earlier record, and
+        // its refusals add to what was measured.
+        crate::pressure::record_unreclaimable(
+            &self.config.cache_dir,
+            unreclaimable.bytes(),
+            crate::pressure::unix_now_secs(),
+        );
         // Every entry is a size-pressure candidate, so each measured one was
         // left in place, whether or not the walk reached it.
         stats.entries_unreclaimable += measured_entries;
@@ -5767,6 +5766,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
         }
         cleanup_tx.commit()?;
+        if reclaim.blobs_unlinked > 0 {
+            crate::pressure::forget_unreclaimable(&self.config.cache_dir);
+        }
         Ok(RemovalAttempt::Done(Some(reclaim)))
     }
 
@@ -5827,6 +5829,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             Ok(())
         };
         drop_index_rows()?;
+        crate::pressure::forget_unreclaimable(&self.config.cache_dir);
         let store_dir = self.config.store_dir();
         if store_dir.exists() {
             // Make everything writable recursively, then remove all subdirs
@@ -9621,6 +9624,49 @@ mod tests {
             "the blob shared with d is not kept for c"
         );
         assert!(store.contains(&c));
+    }
+
+    /// A removal outside a size sweep can take blobs the record counts. The
+    /// record goes with them, or it would hide their bytes' worth of real
+    /// pressure until it expired.
+    #[test]
+    fn removing_blobs_drops_the_unreclaimable_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 1000;
+        let store = Store::open(&config).unwrap();
+        let linked = put_idle_sized_entry(&store, dir.path(), 1, 1500);
+        link_blobs_outside(&store, dir.path(), &linked);
+        let free = put_idle_sized_entry(&store, dir.path(), 2, 400);
+        store.evict().unwrap();
+        assert_eq!(store.size_pressure().unwrap(), 400);
+
+        store.remove_entry(&linked).unwrap();
+        assert_eq!(
+            store.size_pressure().unwrap(),
+            400,
+            "the removed bytes are not subtracted again"
+        );
+
+        // A reconcile that rewrites the index drops a fresh record too; one
+        // that finds nothing to change keeps it.
+        crate::pressure::record_unreclaimable(dir.path(), 400, crate::pressure::unix_now_secs());
+        store.reconcile_blob_index().unwrap();
+        assert_eq!(store.size_pressure().unwrap(), 0, "nothing rewritten");
+        store
+            .db
+            .execute("UPDATE blobs SET refcount = refcount + 1", [])
+            .unwrap();
+        store.reconcile_blob_index().unwrap();
+        assert_eq!(store.size_pressure().unwrap(), 400);
+
+        crate::pressure::record_unreclaimable(dir.path(), 400, crate::pressure::unix_now_secs());
+        store.clear().unwrap();
+        assert!(!store.contains(&free));
+        assert_eq!(
+            crate::pressure::recorded_unreclaimable(dir.path(), crate::pressure::unix_now_secs()),
+            0
+        );
     }
 
     #[test]
