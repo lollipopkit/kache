@@ -1,9 +1,11 @@
 //! Store maintenance the daemon runs when the machine looks quiet.
 //!
-//! Each check first heals drift in the blob index ([`crate::blob_heal`]) and
-//! then compacts `index.db` ([`crate::index_compact`]): a heal frees rows, and
-//! the compaction after it returns their pages to the disk. Both hold the
-//! index write lock while they work, so both wait for a moment with no build.
+//! Each check first heals drift in the blob index ([`crate::blob_heal`]),
+//! then rebuilds a legacy `file_hashes` table ([`crate::file_hash_rebuild`]),
+//! and then compacts `index.db` ([`crate::index_compact`]): the first two free
+//! rows, and the compaction after them returns their pages to the disk. All
+//! three hold the index write lock while they work, so all wait for a moment
+//! with no build.
 
 use crate::config::Config;
 use std::sync::Arc;
@@ -94,15 +96,16 @@ pub(crate) fn unix_now_secs() -> u64 {
 }
 
 /// One maintenance pass. Blocking: call from `spawn_blocking`. The steps log
-/// their own failures; one failing does not stop the other.
+/// their own failures; one failing does not stop the others.
 pub(crate) fn run(config: &Config, trigger: Trigger<'_>) {
     crate::blob_heal::run(config, trigger);
+    crate::file_hash_rebuild::run(config, trigger);
     crate::index_compact::run(config, trigger);
 }
 
 /// Check shortly after daemon start, then every few minutes. A check that
-/// finds nothing to do costs two index opens, one aggregate query over the
-/// blob tables and three PRAGMAs.
+/// finds nothing to do costs three index opens, one aggregate query over the
+/// blob tables, one schema lookup and three PRAGMAs.
 pub(crate) fn spawn_periodic(
     config: Config,
     clock: Arc<RequestClock>,

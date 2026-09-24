@@ -1503,6 +1503,8 @@ pub struct GcPolicyOutcome {
     #[serde(default)]
     pub entries_unreclaimable: usize,
     #[serde(default)]
+    pub unreclaimable_bytes: u64,
+    #[serde(default)]
     pub entries_failed: usize,
     #[serde(default)]
     pub entries_locked: usize,
@@ -1518,6 +1520,7 @@ impl From<&crate::store::GcStats> for GcPolicyOutcome {
             disk_bytes_reclaimed: stats.disk_bytes_reclaimed,
             entries_pinned: stats.entries_pinned,
             entries_unreclaimable: stats.entries_unreclaimable,
+            unreclaimable_bytes: stats.unreclaimable_bytes,
             entries_failed: stats.entries_failed,
             entries_locked: stats.entries_locked,
             evict_write_ms: stats.evict_write_ms,
@@ -6706,7 +6709,7 @@ impl Daemon {
             };
             // The size check is cheap; release the daemon's Store mutex
             // before the long eviction scan and per-entry removals.
-            Ok(Some((lock, store.physical_size()?)))
+            Ok(Some((lock, store.size_pressure()?)))
         })?
         else {
             tracing::debug!("gc.lock held by another GC; skipping size-pressure eviction");
@@ -6736,7 +6739,7 @@ impl Daemon {
         let started = Instant::now();
         let mut stats = store.evict_for(crate::store::SweepOrigin::Automatic)?;
         stats.duration_ms = started.elapsed().as_millis() as u64;
-        if let Ok(after) = store.physical_size() {
+        if let Ok(after) = store.size_pressure() {
             crate::wrapper::record_auto_gc_outcome(&self.config, after);
         }
         Ok(stats)
@@ -6750,7 +6753,7 @@ impl Daemon {
         if driver == GcDriver::Requested {
             return store.evict();
         }
-        let size = store.physical_size()?;
+        let size = store.size_pressure()?;
         if !crate::wrapper::auto_gc_sweep_due(&self.config, size) {
             tracing::info!("periodic GC: size pass not due (under the trigger or backing off)");
             return Ok(crate::store::GcStats::default());
@@ -6798,6 +6801,15 @@ impl Daemon {
                 let mapped = store.backfill_entry_blobs().unwrap_or(0);
                 if mapped > 0 {
                     tracing::info!("backfilled {mapped} entry blob maps");
+                }
+
+                // Leaked refcounts keep bytes counted against max_size that
+                // no eviction can free. The quiet-machine repair never runs
+                // on a host that is always building, so the sweep repairs
+                // too, before the passes measure the store (#1206). The
+                // same setting turns both off.
+                if self.config.index_auto_compact {
+                    crate::blob_heal::run_in_gc(&self.config);
                 }
 
                 match store.file_hash_cache().prune_cc_preprocess_memos() {
@@ -6975,6 +6987,8 @@ impl Daemon {
             entries_unreclaimable: dedup_stats.entries_unreclaimable
                 + evict_stats.entries_unreclaimable
                 + age_evict_stats.entries_unreclaimable,
+            // Only the size pass measures it.
+            unreclaimable_bytes: evict_stats.unreclaimable_bytes,
             disk_bytes_reclaimed: dedup_stats.disk_bytes_reclaimed
                 + evict_stats.disk_bytes_reclaimed
                 + age_evict_stats.disk_bytes_reclaimed,
@@ -12336,6 +12350,71 @@ mod tests {
         assert_eq!(recorded.file_hashes_pruned, Some(0));
     }
 
+    /// #1206: a leaked refcount keeps bytes counted against max_size that no
+    /// eviction can free. The sweep repairs it before its size pass, so the
+    /// pass sees the real store and evicts nothing, even with builds running.
+    #[test]
+    #[cfg(unix)]
+    fn gc_repairs_leaked_refcounts_before_its_size_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 1000;
+        let store = Store::open(&config).unwrap();
+        let src = dir.path().join("lib.rlib");
+        std::fs::write(&src, vec![7u8; 100]).unwrap();
+        store
+            .put(
+                "kept",
+                "c",
+                &["lib".to_string()],
+                &[],
+                "host",
+                "dev",
+                &[(src.clone(), "lib.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        // Idle and held by nothing outside the store: evictable.
+        std::fs::remove_file(&src).unwrap();
+        store.set_last_accessed_for_test("kept", "-1 hour");
+        // A blob row no entry owns, as a leaked refcount leaves behind.
+        store
+            .file_hash_cache()
+            .db()
+            .execute(
+                "INSERT INTO blobs (hash, size, refcount) VALUES (?1, 5000, 3)",
+                rusqlite::params!["f".repeat(64)],
+            )
+            .unwrap();
+        assert_eq!(store.physical_size().unwrap(), 5100);
+        let permits = config.cache_dir.join("scheduler").join("permits");
+        std::fs::create_dir_all(&permits).unwrap();
+        let _build = crate::store::StoreLock::try_acquire(&permits.join("0"))
+            .unwrap()
+            .unwrap();
+
+        let mut disabled = config.clone();
+        disabled.index_auto_compact = false;
+        Daemon::new(disabled)
+            .run_gc(GcPolicy::ExplicitAge { hours: 24 }, GcDriver::Requested)
+            .unwrap();
+        assert!(
+            !store.blob_refcount_drift().unwrap().is_clean(),
+            "turned off with the rest of the index maintenance"
+        );
+
+        assert!(config.index_auto_compact);
+        let daemon = Daemon::new(config.clone());
+        let report = daemon
+            .run_gc(GcPolicy::Automatic { max_age_hours: 0 }, GcDriver::Periodic)
+            .unwrap();
+        assert_eq!(report.total.entries_evicted, 0, "{report:?}");
+        assert!(store.contains("kept"));
+        assert!(store.blob_refcount_drift().unwrap().is_clean());
+        assert_eq!(store.physical_size().unwrap(), 100);
+    }
+
     /// kunobi-ninja/kache#711: automatic GC applies configured age retention
     /// even while the store is below its size budget.
     #[test]
@@ -12558,14 +12637,15 @@ mod tests {
         assert_eq!(recorded.entries_evicted, 1);
     }
 
-    /// Store an idle `size`-byte entry for the upload-eviction tests; with
-    /// `retained`, a target directory still hardlinks its blob.
+    /// Store a `size`-byte entry for the upload-eviction tests. It is idle,
+    /// unless `pinned`: then it was accessed just now, so eviction leaves it
+    /// and the store stays over budget.
     fn put_upload_evict_entry(
         store: &Store,
         dir: &std::path::Path,
         key: &str,
         size: usize,
-        retained: bool,
+        pinned: bool,
     ) {
         let src_file = dir.join(format!("{key}.rlib"));
         std::fs::write(&src_file, &key.repeat(size)[..size]).unwrap();
@@ -12583,15 +12663,9 @@ mod tests {
             )
             .unwrap();
         std::fs::remove_file(&src_file).unwrap();
-        if retained {
-            let meta = store.get(key).unwrap().unwrap();
-            std::fs::hard_link(
-                store.blob_path(&meta.files[0].hash),
-                dir.join(format!("{key}-target.rlib")),
-            )
-            .unwrap();
+        if !pinned {
+            store.set_last_accessed_for_test(key, "-1 hour");
         }
-        store.set_last_accessed_for_test(key, "-1 hour");
     }
 
     /// Every upload used to start another full sweep of a store the last
@@ -12603,14 +12677,14 @@ mod tests {
         config.max_size = 1000;
         let store = Store::open(&config).unwrap();
         for i in 0..6 {
-            put_upload_evict_entry(&store, dir.path(), &format!("retained_{i}"), 200, true);
+            put_upload_evict_entry(&store, dir.path(), &format!("pinned_{i}"), 200, true);
         }
         put_upload_evict_entry(&store, dir.path(), "evictable", 50, false);
 
         let daemon = Daemon::new(config.clone());
         daemon.maybe_evict_after_upload();
         assert!(!store.contains("evictable"));
-        assert!(store.contains("retained_0"));
+        assert!(store.contains("pinned_0"));
         assert!(
             dir.path().join("auto-gc-backoff.json").exists(),
             "a sweep that leaves the store over budget records a backoff"
@@ -12688,7 +12762,7 @@ mod tests {
         config.max_size = 1000;
         let store = Store::open(&config).unwrap();
         for i in 0..6 {
-            put_upload_evict_entry(&store, dir.path(), &format!("retained_{i}"), 200, true);
+            put_upload_evict_entry(&store, dir.path(), &format!("pinned_{i}"), 200, true);
         }
         put_upload_evict_entry(&store, dir.path(), "evictable", 50, false);
 
@@ -12812,13 +12886,13 @@ mod tests {
         }
     }
 
-    /// Entries for the periodic-sweep tests: a store over budget on retained
-    /// bytes, one entry past the age policy and one idle entry a size pass
-    /// would evict.
+    /// Entries for the periodic-sweep tests: a store over budget on entries
+    /// builds are using, one entry past the age policy and one idle entry a
+    /// size pass would evict.
     fn seed_periodic_gc_store(config: &Config, dir: &Path) -> Store {
         let store = Store::open(config).unwrap();
         for i in 0..6 {
-            put_upload_evict_entry(&store, dir, &format!("retained_{i}"), 200, true);
+            put_upload_evict_entry(&store, dir, &format!("pinned_{i}"), 200, true);
         }
         put_upload_evict_entry(&store, dir, "old", 50, false);
         store.set_last_accessed_for_test("old", "-48 hours");
@@ -12871,7 +12945,7 @@ mod tests {
         assert_eq!(
             crate::wrapper::auto_gc_backoff_interval_for_test(dir.path()),
             Some(600),
-            "the retained entries keep the store over budget"
+            "the pinned entries keep the store over budget"
         );
 
         crate::wrapper::expire_auto_gc_backoff_for_test(dir.path());
@@ -12881,9 +12955,9 @@ mod tests {
             Some(1200)
         );
 
-        // Free the retained blobs: the next due sweep fits the store.
+        // The builds finish: the next due sweep fits the store.
         for i in 0..6 {
-            std::fs::remove_file(dir.path().join(format!("retained_{i}-target.rlib"))).unwrap();
+            store.set_last_accessed_for_test(&format!("pinned_{i}"), "-1 hour");
         }
         crate::wrapper::expire_auto_gc_backoff_for_test(dir.path());
         daemon.run_gc(policy, GcDriver::Periodic).unwrap();
@@ -12892,6 +12966,45 @@ mod tests {
             crate::wrapper::auto_gc_backoff_interval_for_test(dir.path()),
             None
         );
+    }
+
+    /// #1206: bytes target directories still hold used to keep the store
+    /// over budget. Every due sweep evicted the idle entries it could free,
+    /// ended over budget anyway, and backed off to try again.
+    #[test]
+    fn periodic_gc_leaves_linked_bytes_out_of_its_size_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 1000;
+        let store = Store::open(&config).unwrap();
+        for i in 0..6 {
+            let key = format!("linked_{i}");
+            put_upload_evict_entry(&store, dir.path(), &key, 200, false);
+            let meta = store.get(&key).unwrap().unwrap();
+            std::fs::hard_link(
+                store.blob_path(&meta.files[0].hash),
+                dir.path().join(format!("{key}-target.rlib")),
+            )
+            .unwrap();
+        }
+        put_upload_evict_entry(&store, dir.path(), "idle", 50, false);
+
+        let daemon = Daemon::new(config.clone());
+        let policy = GcPolicy::Automatic { max_age_hours: 0 };
+        let report = daemon.run_gc(policy, GcDriver::Periodic).unwrap();
+        assert_eq!(report.size.entries_evicted, 0, "{report:?}");
+        assert_eq!(report.size.entries_unreclaimable, 6, "{report:?}");
+        assert_eq!(report.size.unreclaimable_bytes, 1200, "{report:?}");
+        assert!(store.contains("idle"), "50 freeable bytes fit the budget");
+        assert_eq!(
+            crate::wrapper::auto_gc_backoff_interval_for_test(dir.path()),
+            None,
+            "nothing to back off from"
+        );
+        assert!(!crate::wrapper::auto_gc_sweep_due(
+            &config,
+            store.size_pressure().unwrap()
+        ));
     }
 
     #[test]

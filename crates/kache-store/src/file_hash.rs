@@ -282,28 +282,6 @@ impl<'db> FileHashCache<'db> {
         self.prune_input_predictions_at(unix_now())
     }
 
-    /// Delete file hash rows not written for [`FILE_HASH_RETENTION_SECS`].
-    /// Run from the GC sweep and `doctor --repair`, like
-    /// [`Self::prune_input_predictions`]. A lookup never refreshes a row, so
-    /// that the hit path stays read-only; the price is one re-hash a month
-    /// for a file read that whole time without changing.
-    pub fn prune_file_hashes(&self) -> rusqlite::Result<usize> {
-        self.prune_file_hashes_at(unix_now())
-    }
-
-    fn prune_file_hashes_at(&self, now: i64) -> rusqlite::Result<usize> {
-        // Built here, not when a wrapper opens the index, for the reason
-        // given in `prune_input_predictions_at`.
-        self.db().execute_batch(
-            "CREATE INDEX IF NOT EXISTS file_hashes_updated_at
-             ON file_hashes(updated_at)",
-        )?;
-        self.db().execute(
-            "DELETE FROM file_hashes WHERE updated_at < datetime(?1, 'unixepoch')",
-            params![now.saturating_sub(FILE_HASH_RETENTION_SECS)],
-        )
-    }
-
     fn prune_input_predictions_at(&self, now: i64) -> rusqlite::Result<usize> {
         // Built here, not when a wrapper upgrades the table: indexing a large
         // table takes the write lock for seconds, and this runs off the build.
@@ -318,12 +296,81 @@ impl<'db> FileHashCache<'db> {
     }
 }
 
+impl FileHashCache<'_> {
+    /// Delete file hash rows not written for [`FILE_HASH_RETENTION_SECS`],
+    /// at most [`FILE_HASH_PRUNE_CAP`] per call. Run from the GC sweep and
+    /// `doctor --repair`, like [`Self::prune_input_predictions`]. A lookup
+    /// never refreshes a row, so that the hit path stays read-only; the price
+    /// is one re-hash a month for a file read that whole time without
+    /// changing.
+    ///
+    /// There is no index on `updated_at`: every write would pay for it, and
+    /// in the `WITHOUT ROWID` table it would store each path a second time.
+    /// The rows are found with a plain read instead and deleted in chunks. A
+    /// single `DELETE` of four million expired rows held the write lock for
+    /// over half a minute, and builds failed on their 5 s busy timeout.
+    pub fn prune_file_hashes(&self) -> rusqlite::Result<usize> {
+        self.prune_file_hashes_at(unix_now(), FILE_HASH_PRUNE_CAP)
+    }
+
+    fn prune_file_hashes_at(&self, now: i64, cap: usize) -> rusqlite::Result<usize> {
+        self.prune_file_hashes_with_hook(now, cap, || {})
+    }
+
+    /// [`Self::prune_file_hashes_at`] with a test seam between the read and
+    /// the deletes, where a build may record a path again.
+    fn prune_file_hashes_with_hook(
+        &self,
+        now: i64,
+        cap: usize,
+        after_read: impl FnOnce(),
+    ) -> rusqlite::Result<usize> {
+        let cutoff = now.saturating_sub(FILE_HASH_RETENTION_SECS);
+        // Found with a plain read, which takes no write lock. The deletes
+        // then take it once per chunk, so a build waits for one chunk at most.
+        let stale: Vec<String> = {
+            let mut stmt = self.db().prepare(
+                "SELECT path FROM file_hashes
+                 WHERE updated_at < datetime(?1, 'unixepoch') LIMIT ?2",
+            )?;
+            stmt.query_map(params![cutoff, cap as i64], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        after_read();
+        let mut removed = 0;
+        for chunk in stale.chunks(FILE_HASH_PRUNE_CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            // The age is checked again: a build may have recorded the path
+            // since the read.
+            let sql = format!(
+                "DELETE FROM file_hashes WHERE path IN ({placeholders})
+                 AND updated_at < datetime(?, 'unixepoch')"
+            );
+            let params = chunk
+                .iter()
+                .map(|path| path as &dyn rusqlite::ToSql)
+                .chain(std::iter::once(&cutoff as &dyn rusqlite::ToSql));
+            removed += self
+                .db()
+                .execute(&sql, rusqlite::params_from_iter(params))?;
+        }
+        Ok(removed)
+    }
+}
+
 /// How long a file hash row is kept after it was last written. The memo is
 /// only a saving: a row pruned while its file is still in use costs one
 /// re-read of that file, at most once per retention window. Without a bound
 /// the table kept every path any build ever hashed, so worktrees and
 /// checkouts deleted long ago stayed in it for good (kunobi-ninja/kache#1206).
 pub const FILE_HASH_RETENTION_SECS: i64 = 30 * 86_400;
+
+/// Most rows one prune deletes. A table that grew for months is emptied over
+/// several GC sweeps rather than held in memory at once.
+pub const FILE_HASH_PRUNE_CAP: usize = 100_000;
+
+/// Rows deleted per write transaction.
+const FILE_HASH_PRUNE_CHUNK: usize = 500;
 
 /// A prediction hit refreshes `last_used` only when the stamp is this old.
 pub const INPUT_PREDICTION_TOUCH_INTERVAL_SECS: i64 = 86_400;
@@ -380,11 +427,10 @@ fn ensure_input_predictions_last_used(db: &Connection, now: i64) -> rusqlite::Re
     tx.commit()
 }
 
-pub fn ensure_file_hash_cache_schema(db: &Connection) -> rusqlite::Result<()> {
-    crate::cc_memo::ensure_schema(db)?;
-    crate::cc_memo::ensure_mapped_hash_schema(db)?;
-    db.execute_batch(
-        "CREATE TABLE IF NOT EXISTS file_hashes (
+/// Columns of `file_hashes`. `WITHOUT ROWID` keeps the rows in the primary
+/// key's b-tree, so each path is stored once; a rowid table also stores it in
+/// the key's automatic index.
+const FILE_HASHES_TABLE: &str = "(
             path       TEXT PRIMARY KEY,
             size       INTEGER NOT NULL,
             mtime_ns   INTEGER NOT NULL,
@@ -392,7 +438,92 @@ pub fn ensure_file_hash_cache_schema(db: &Connection) -> rusqlite::Result<()> {
             inode      INTEGER NOT NULL DEFAULT 0,
             hash       TEXT NOT NULL,
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
+        ) WITHOUT ROWID";
+
+/// Whether `file_hashes` is the rowid table versions before #1206 created.
+///
+/// TODO: remove with [`FileHashCache::rebuild_file_hashes_without_rowid`]
+/// once no supported store can still hold the rowid table.
+pub fn file_hashes_has_rowid(db: &Connection) -> rusqlite::Result<bool> {
+    let sql: Option<String> = db
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'file_hashes'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(sql.is_some_and(|sql| !sql.to_ascii_uppercase().contains("WITHOUT ROWID")))
+}
+
+/// What the rebuild of a rowid `file_hashes` would copy: all rows, and the
+/// ones the prune should delete first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileHashRows {
+    pub rows: u64,
+    pub expired: u64,
+}
+
+impl FileHashCache<'_> {
+    /// Count the rows of `file_hashes` and those older than the prune
+    /// window, in one read that takes no write lock.
+    pub fn file_hash_rows(&self) -> rusqlite::Result<FileHashRows> {
+        self.file_hash_rows_at(unix_now())
+    }
+
+    fn file_hash_rows_at(&self, now: i64) -> rusqlite::Result<FileHashRows> {
+        self.db().query_row(
+            "SELECT COUNT(*), COALESCE(SUM(updated_at < datetime(?1, 'unixepoch')), 0)
+             FROM file_hashes",
+            params![now.saturating_sub(FILE_HASH_RETENTION_SECS)],
+            |row| {
+                Ok(FileHashRows {
+                    rows: row.get::<_, i64>(0)?.max(0) as u64,
+                    expired: row.get::<_, i64>(1)?.max(0) as u64,
+                })
+            },
+        )
+    }
+
+    /// Rebuild a rowid `file_hashes` as `WITHOUT ROWID`. Returns the rows
+    /// copied, or `None` when the table needed no rebuild.
+    ///
+    /// Copies every row while holding the index write lock, so callers run
+    /// it when no build is waiting: the daemon's quiet maintenance and
+    /// `kache doctor --repair`. Not the schema setup every wrapper runs, where
+    /// a large table would keep a build's first index write waiting.
+    ///
+    /// TODO: remove once no supported store can still hold the rowid table.
+    pub fn rebuild_file_hashes_without_rowid(&self) -> rusqlite::Result<Option<usize>> {
+        let tx = Transaction::new_unchecked(self.db(), TransactionBehavior::Immediate)?;
+        if !file_hashes_has_rowid(&tx)? {
+            return Ok(None);
+        }
+        tx.execute_batch(&format!(
+            "CREATE TABLE file_hashes_rebuild {FILE_HASHES_TABLE}"
+        ))?;
+        // A rowid table accepts a NULL primary key; the new one does not, and
+        // no lookup can match such a row.
+        let copied = tx.execute(
+            "INSERT INTO file_hashes_rebuild
+                 (path, size, mtime_ns, ctime_ns, inode, hash, updated_at)
+             SELECT path, size, mtime_ns, ctime_ns, inode, hash, updated_at
+             FROM file_hashes WHERE path IS NOT NULL",
+            [],
+        )?;
+        tx.execute_batch(
+            "DROP TABLE file_hashes;
+             ALTER TABLE file_hashes_rebuild RENAME TO file_hashes;",
+        )?;
+        tx.commit()?;
+        Ok(Some(copied))
+    }
+}
+
+pub fn ensure_file_hash_cache_schema(db: &Connection) -> rusqlite::Result<()> {
+    crate::cc_memo::ensure_schema(db)?;
+    crate::cc_memo::ensure_mapped_hash_schema(db)?;
+    db.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS file_hashes {FILE_HASHES_TABLE};
         CREATE TABLE IF NOT EXISTS input_predictions (
             identity        TEXT PRIMARY KEY,
             schema          INTEGER NOT NULL,
@@ -411,8 +542,11 @@ pub fn ensure_file_hash_cache_schema(db: &Connection) -> rusqlite::Result<()> {
         );
         -- Boolean answers from the first env-use scanner, which missed
         -- computed names and other spellings. Nothing reads them any more.
-        DROP TABLE IF EXISTS source_env_runtime_uses;",
-    )?;
+        DROP TABLE IF EXISTS source_env_runtime_uses;
+        -- TODO: remove once no supported store can still hold it. The first
+        -- file hash prune indexed `updated_at`; see `prune_file_hashes`.
+        DROP INDEX IF EXISTS file_hashes_updated_at;"
+    ))?;
     for column in [
         "ALTER TABLE file_hashes ADD COLUMN ctime_ns INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE file_hashes ADD COLUMN inode INTEGER NOT NULL DEFAULT 0",
@@ -635,7 +769,12 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(cache.prune_file_hashes_at(now).unwrap(), 1);
+        assert_eq!(
+            cache
+                .prune_file_hashes_at(now, FILE_HASH_PRUNE_CAP)
+                .unwrap(),
+            1
+        );
         let mut left: Vec<String> = db
             .prepare("SELECT path FROM file_hashes ORDER BY path")
             .unwrap()
@@ -1052,6 +1191,200 @@ mod tests {
             .put_input_prediction("unit", 2, None, "payload-2")
             .unwrap();
         assert!(prediction_last_used(&cache, "unit") >= before);
+    }
+
+    fn put_file_hash_recorded_at(cache: &FileHashCache<'_>, path: &str, at: i64) {
+        let fingerprint = FileFingerprint {
+            path: path.to_string(),
+            size: 1,
+            mtime_ns: 2,
+            ctime_ns: 3,
+            inode: 4,
+        };
+        cache.put(&fingerprint, "hash").unwrap();
+        cache
+            .db()
+            .execute(
+                "UPDATE file_hashes SET updated_at = datetime(?2, 'unixepoch') WHERE path = ?1",
+                params![path, at],
+            )
+            .unwrap();
+    }
+
+    fn file_hash_paths(cache: &FileHashCache<'_>) -> Vec<String> {
+        let mut stmt = cache
+            .db()
+            .prepare("SELECT path FROM file_hashes ORDER BY path")
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn prune_file_hashes_stops_at_the_cap_and_spans_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        let now = 1_900_000_000;
+        let rows = FILE_HASH_PRUNE_CHUNK * 2 + 1;
+        for i in 0..rows {
+            put_file_hash_recorded_at(&cache, &format!("/old/{i:05}"), 1);
+        }
+        put_file_hash_recorded_at(&cache, "/fresh", now);
+
+        assert_eq!(cache.prune_file_hashes_at(now, rows - 1).unwrap(), rows - 1);
+        assert_eq!(file_hash_paths(&cache).len(), 2, "one old row waits");
+        assert_eq!(cache.prune_file_hashes_at(now, rows).unwrap(), 1);
+        assert_eq!(file_hash_paths(&cache), ["/fresh"]);
+    }
+
+    /// A build that records a path between the prune's read and its delete
+    /// keeps the row: the delete checks the age again.
+    #[test]
+    fn prune_file_hashes_keeps_a_row_recorded_during_the_prune() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let cache = FileHashCache::open(&db_path).unwrap();
+        let now = unix_now();
+        put_file_hash_recorded_at(&cache, "/refreshed", 1);
+        put_file_hash_recorded_at(&cache, "/old", 1);
+
+        let build = FileHashCache::open(&db_path).unwrap();
+        let removed = cache
+            .prune_file_hashes_with_hook(now, FILE_HASH_PRUNE_CAP, || {
+                let fingerprint = FileFingerprint {
+                    path: "/refreshed".to_string(),
+                    size: 9,
+                    mtime_ns: 9,
+                    ctime_ns: 9,
+                    inode: 9,
+                };
+                build.put(&fingerprint, "new-hash").unwrap();
+            })
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(file_hash_paths(&cache), ["/refreshed"]);
+    }
+
+    #[test]
+    fn file_hash_rows_counts_all_and_expired_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        // November 2023: by the real clock every row is years old.
+        let now = 1_700_000_000;
+        assert_eq!(
+            cache.file_hash_rows_at(now).unwrap(),
+            FileHashRows {
+                rows: 0,
+                expired: 0
+            }
+        );
+        let cutoff = now - FILE_HASH_RETENTION_SECS;
+        put_file_hash_recorded_at(&cache, "/old", cutoff - 1);
+        put_file_hash_recorded_at(&cache, "/boundary", cutoff);
+        put_file_hash_recorded_at(&cache, "/fresh", now);
+        assert_eq!(
+            cache.file_hash_rows_at(now).unwrap(),
+            FileHashRows {
+                rows: 3,
+                expired: 1
+            }
+        );
+        assert_eq!(cache.file_hash_rows().unwrap().expired, 3, "wall clock");
+    }
+
+    #[test]
+    fn prune_file_hashes_uses_the_wall_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        put_file_hash_recorded_at(&cache, "/old", unix_now() - FILE_HASH_RETENTION_SECS - 60);
+        put_file_hash_recorded_at(&cache, "/fresh", unix_now());
+        assert_eq!(cache.prune_file_hashes().unwrap(), 1);
+        assert_eq!(file_hash_paths(&cache), ["/fresh"]);
+    }
+
+    #[test]
+    fn prune_limits_are_the_documented_ones() {
+        assert_eq!(FILE_HASH_PRUNE_CAP, 100_000);
+        assert_eq!(FILE_HASH_PRUNE_CHUNK, 500);
+    }
+
+    #[test]
+    fn a_new_index_creates_file_hashes_without_rowid() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        assert!(!file_hashes_has_rowid(cache.db()).unwrap());
+        assert_eq!(cache.rebuild_file_hashes_without_rowid().unwrap(), None);
+    }
+
+    /// #1206: the rowid table older versions created stores every path in
+    /// the table and again in its primary key's automatic index.
+    #[test]
+    fn a_rowid_file_hashes_is_rebuilt_with_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        {
+            let db = Connection::open(&db_path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE file_hashes (
+                    path       TEXT PRIMARY KEY,
+                    size       INTEGER NOT NULL,
+                    mtime_ns   INTEGER NOT NULL,
+                    hash       TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                INSERT INTO file_hashes (path, size, mtime_ns, hash, updated_at)
+                    VALUES ('/kept', 7, 8, 'kept-hash', '2026-01-02 03:04:05'),
+                           (NULL, 1, 1, 'unreachable', '2026-01-02 03:04:05');",
+            )
+            .unwrap();
+        }
+        // Opening adds the later columns and leaves the table a rowid table.
+        let cache = FileHashCache::open(&db_path).unwrap();
+        assert!(file_hashes_has_rowid(cache.db()).unwrap());
+        let legacy_indexes: i64 = cache
+            .db()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND tbl_name = 'file_hashes'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_indexes, 1, "the primary key's automatic index");
+
+        assert_eq!(cache.rebuild_file_hashes_without_rowid().unwrap(), Some(1));
+        assert!(!file_hashes_has_rowid(cache.db()).unwrap());
+        let indexes: i64 = cache
+            .db()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND tbl_name = 'file_hashes'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 0, "the rows live in the primary key's b-tree");
+        let kept = FileFingerprint {
+            path: "/kept".to_string(),
+            size: 7,
+            mtime_ns: 8,
+            ctime_ns: 0,
+            inode: 0,
+        };
+        assert_eq!(cache.get(&kept).unwrap().as_deref(), Some("kept-hash"));
+        let updated_at: String = cache
+            .db()
+            .query_row("SELECT updated_at FROM file_hashes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(updated_at, "2026-01-02 03:04:05", "the age survives");
+        assert_eq!(cache.rebuild_file_hashes_without_rowid().unwrap(), None);
+
+        // Writers keep working, and a reopen runs the schema setup again.
+        cache.put(&kept, "new-hash").unwrap();
+        drop(cache);
+        let cache = FileHashCache::open(&db_path).unwrap();
+        assert_eq!(cache.get(&kept).unwrap().as_deref(), Some("new-hash"));
+        assert!(!file_hashes_has_rowid(cache.db()).unwrap());
     }
 
     #[test]

@@ -361,6 +361,9 @@ pub(crate) fn snapshot_from_direct_reads(
 
 /// Index tables whose size explains a store: the entry and blob maps that grow
 /// with the cache, and the key-side caches and tombstones beside them.
+/// `file_hashes` reports only while it is still the rowid table older
+/// versions created: a `WITHOUT ROWID` table has no rowid to read, and the
+/// failed query leaves it out (#1206).
 const MACHINE_INDEX_TABLES: [&str; 7] = [
     "entries",
     "blobs",
@@ -2237,9 +2240,24 @@ pub(crate) fn describe_eviction(stats: &crate::store::GcStats, over_limit: bool)
     }
 
     if stats.entries_unreclaimable > 0 {
+        // Measured by a size sweep, and left out of its size pressure.
+        let (size, limit) = if stats.unreclaimable_bytes > 0 {
+            (
+                format!("{}, ", ByteSize(stats.unreclaimable_bytes)),
+                " They do not count against the size limit.",
+            )
+        } else {
+            (String::new(), "")
+        };
+        // Left out of the pressure, they can leave a store that fits.
+        let verdict = if stats.unreclaimable_bytes > 0 && !over_limit {
+            "nothing to evict; the rest of the store fits its limit."
+        } else {
+            "nothing reclaimable on disk."
+        };
         return format!(
-            " nothing reclaimable on disk.\n  {} {} cloned into build outputs \
-             (same bytes as target/, not extra).\n  Remove stale outputs with \
+            " {verdict}\n  {} {} cloned into build outputs \
+             ({size}same bytes as target/, not extra).{limit}\n  Remove stale outputs with \
              `kache clean --tracked --stale 14d --dry-run`, then run `kache gc` again.",
             stats.entries_unreclaimable,
             plural(stats.entries_unreclaimable),
@@ -3252,7 +3270,7 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
     let evict_stats = store.evict_for(mode.sweep_origin())?;
     add_gc_stats(&mut combined, &evict_stats);
     if verbose {
-        let over_limit = store_over_limit(store.physical_size().ok(), config.max_size);
+        let over_limit = store_over_limit(store.size_pressure().ok(), config.max_size);
         println!("{}", describe_eviction(&evict_stats, over_limit));
     }
 
@@ -3311,7 +3329,7 @@ pub fn run_auto_gc_worker(config: &Config, retry_delay: std::time::Duration) {
     if !swept {
         return;
     }
-    match Store::open(config).and_then(|store| store.physical_size()) {
+    match Store::open(config).and_then(|store| store.size_pressure()) {
         Ok(size) => crate::wrapper::record_auto_gc_outcome(config, size),
         Err(e) => tracing::debug!("auto-gc: store size after the sweep unknown: {e:#}"),
     }
@@ -3322,7 +3340,7 @@ pub fn run_auto_gc_worker(config: &Config, retry_delay: std::time::Duration) {
 /// may have swept since, and the first sweep may have cleared the pressure.
 fn auto_gc_worker_sweep(config: &Config) -> Option<crate::store::GcStats> {
     let size = Store::open(config)
-        .and_then(|store| store.physical_size())
+        .and_then(|store| store.size_pressure())
         .ok()?;
     if !crate::wrapper::auto_gc_sweep_due(config, size) {
         return None;
@@ -3352,6 +3370,9 @@ fn add_gc_stats(total: &mut crate::store::GcStats, part: &crate::store::GcStats)
     total.entries_unreclaimable = total
         .entries_unreclaimable
         .saturating_add(part.entries_unreclaimable);
+    total.unreclaimable_bytes = total
+        .unreclaimable_bytes
+        .saturating_add(part.unreclaimable_bytes);
     total.disk_bytes_reclaimed = total
         .disk_bytes_reclaimed
         .saturating_add(part.disk_bytes_reclaimed);
@@ -3382,6 +3403,9 @@ fn gc_stats_from_breakdown(report: &crate::daemon::GcBreakdown) -> crate::store:
         total.entries_unreclaimable = total
             .entries_unreclaimable
             .saturating_add(part.entries_unreclaimable);
+        total.unreclaimable_bytes = total
+            .unreclaimable_bytes
+            .saturating_add(part.unreclaimable_bytes);
         total.entries_failed = total.entries_failed.saturating_add(part.entries_failed);
         total.entries_locked = total.entries_locked.saturating_add(part.entries_locked);
         total.evict_write_ms = total.evict_write_ms.saturating_add(part.evict_write_ms);
@@ -3523,7 +3547,7 @@ pub fn gc(
                         );
                     }
                     let store = Store::open(config)?;
-                    let over_limit = store_over_limit(store.physical_size().ok(), config.max_size);
+                    let over_limit = store_over_limit(store.size_pressure().ok(), config.max_size);
                     println!("{}", describe_eviction(&combined, over_limit));
                 }
             } else if human_gc_output(json) {
@@ -3564,7 +3588,7 @@ pub fn gc(
                 let evict_stats = evict_older_than_recorded(&store, config, hours)?;
                 combined = evict_stats.clone();
                 if human_gc_output(json) {
-                    let over_limit = store_over_limit(store.physical_size().ok(), config.max_size);
+                    let over_limit = store_over_limit(store.size_pressure().ok(), config.max_size);
                     println!("{}", describe_eviction(&evict_stats, over_limit));
                 }
             } else {
@@ -6664,9 +6688,28 @@ pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<VerifyOu
             Ok(removed) => println!("Repairing: removed {removed} unused input predictions"),
             Err(error) => println!("Warning: could not prune input predictions: {error}"),
         }
-        match memos.prune_file_hashes() {
+        // Everything expired, not one GC's share: the rebuild below copies
+        // what is left.
+        let mut pruned = 0;
+        let prune = loop {
+            match memos.prune_file_hashes() {
+                Ok(0) => break Ok(pruned),
+                Ok(removed) => pruned += removed,
+                Err(error) => break Err(error),
+            }
+        };
+        match prune {
             Ok(removed) => println!("Repairing: removed {removed} old file hashes"),
             Err(error) => println!("Warning: could not prune file hashes: {error}"),
+        }
+        // TODO: remove once no supported store can still hold the rowid
+        // table (#1206).
+        match memos.rebuild_file_hashes_without_rowid() {
+            Ok(Some(rows)) => {
+                println!("Repairing: rebuilt the file hash table without rowids ({rows} rows)")
+            }
+            Ok(None) => {}
+            Err(error) => println!("Warning: could not rebuild the file hash table: {error}"),
         }
         match memos.compact_sparse_index() {
             Ok(Some((before, after))) => println!(
@@ -7359,6 +7402,7 @@ mod tests {
                 entries_pinned: (n * 100) as usize,
                 disk_bytes_reclaimed: n * 1_000,
                 entries_unreclaimable: (n * 10_000) as usize,
+                unreclaimable_bytes: n * 100_000_000,
                 entries_failed: (n * 100_000) as usize,
                 entries_locked: (n * 1_000_000) as usize,
                 evict_write_ms: n * 10_000_000,
@@ -7376,6 +7420,7 @@ mod tests {
         assert_eq!(total.entries_pinned, 600);
         assert_eq!(total.disk_bytes_reclaimed, 6_000);
         assert_eq!(total.entries_unreclaimable, 60_000);
+        assert_eq!(total.unreclaimable_bytes, 600_000_000);
         assert_eq!(total.entries_failed, 600_000);
         assert_eq!(total.entries_locked, 6_000_000);
         assert_eq!(total.evict_write_ms, 60_000_000);
@@ -7387,6 +7432,7 @@ mod tests {
             blobs_removed: 4,
             duration_ms: 7,
             entries_unreclaimable: 5,
+            unreclaimable_bytes: 12,
             disk_bytes_reclaimed: 6,
             skipped: false,
             entries_failed: 8,
@@ -7405,6 +7451,7 @@ mod tests {
             blobs_removed: 40,
             duration_ms: 70,
             entries_unreclaimable: 50,
+            unreclaimable_bytes: 120,
             disk_bytes_reclaimed: 60,
             skipped: true,
             entries_failed: 80,
@@ -7423,6 +7470,7 @@ mod tests {
         assert_eq!(accumulated.blobs_removed, 44);
         assert_eq!(accumulated.duration_ms, 77);
         assert_eq!(accumulated.entries_unreclaimable, 55);
+        assert_eq!(accumulated.unreclaimable_bytes, 132);
         assert_eq!(accumulated.disk_bytes_reclaimed, 66);
         assert_eq!(accumulated.entries_failed, 88);
         assert_eq!(accumulated.entries_locked, 99);
@@ -8081,8 +8129,29 @@ mod tests {
         let mut stats = gc_stats(0, 0, 0);
         stats.entries_unreclaimable = 1;
         let msg = describe_eviction(&stats, false);
-        assert!(msg.contains("1 entry cloned"), "{msg}");
+        assert!(
+            msg.contains("1 entry cloned into build outputs (same bytes as target/, not extra).\n"),
+            "{msg}"
+        );
         assert!(msg.contains("clean --tracked"), "{msg}");
+
+        assert!(msg.starts_with(" nothing reclaimable on disk.\n"), "{msg}");
+
+        stats.unreclaimable_bytes = 3 * 1024 * 1024;
+        let msg = describe_eviction(&stats, false);
+        assert!(
+            msg.contains(
+                "1 entry cloned into build outputs (3.0 MiB, same bytes as target/, not extra). \
+                 They do not count against the size limit.\n"
+            ),
+            "{msg}"
+        );
+        assert!(
+            msg.starts_with(" nothing to evict; the rest of the store fits its limit.\n"),
+            "{msg}"
+        );
+        let msg = describe_eviction(&stats, true);
+        assert!(msg.starts_with(" nothing reclaimable on disk.\n"), "{msg}");
     }
 
     #[test]
@@ -10584,6 +10653,54 @@ mod tests {
         let clean = verify(&config, false, false).unwrap();
         assert_eq!(clean.index_drift, 0, "{clean:?}");
         assert_eq!(clean.unresolved_integrity_findings(), 0, "{clean:?}");
+    }
+
+    /// #1206: `doctor --repair` prunes old file hashes and rebuilds the
+    /// rowid table older versions created.
+    #[test]
+    fn verify_repair_prunes_and_rebuilds_file_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), None);
+        drop(Store::open(&config).unwrap());
+        let db = crate::store::open_index_db(&config.index_db_path()).unwrap();
+        db.execute_batch(
+            "DROP TABLE file_hashes;
+             CREATE TABLE file_hashes (
+                 path       TEXT PRIMARY KEY,
+                 size       INTEGER NOT NULL,
+                 mtime_ns   INTEGER NOT NULL,
+                 ctime_ns   INTEGER NOT NULL DEFAULT 0,
+                 inode      INTEGER NOT NULL DEFAULT 0,
+                 hash       TEXT NOT NULL,
+                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             INSERT INTO file_hashes (path, size, mtime_ns, hash, updated_at)
+                 VALUES ('/old', 1, 1, 'h', '2000-01-01 00:00:00'),
+                        ('/recent', 1, 1, 'h', datetime('now'));",
+        )
+        .unwrap();
+        assert!(crate::cache_key::file_hashes_has_rowid(&db).unwrap());
+        drop(db);
+
+        verify(&config, false, false).unwrap();
+        let db = crate::store::open_index_db(&config.index_db_path()).unwrap();
+        assert!(
+            crate::cache_key::file_hashes_has_rowid(&db).unwrap(),
+            "only --repair rebuilds"
+        );
+        drop(db);
+
+        verify(&config, false, true).unwrap();
+        let db = crate::store::open_index_db(&config.index_db_path()).unwrap();
+        assert!(!crate::cache_key::file_hashes_has_rowid(&db).unwrap());
+        let paths: Vec<String> = db
+            .prepare("SELECT path FROM file_hashes")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(paths, ["/recent"]);
     }
 
     #[test]

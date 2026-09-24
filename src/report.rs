@@ -4052,6 +4052,7 @@ mod tests {
         assert_eq!(records[1].key_locks_removed, None);
         assert_eq!(records[1].key_locks_remaining, None);
         assert_eq!(records[1].predictions_pruned, None);
+        assert_eq!(records[1].file_hashes_pruned, None);
         assert!(!log.lines().nth(1).unwrap().contains("key_locks"), "{log}");
     }
 

@@ -21,6 +21,7 @@ mod events;
 mod extra_inputs;
 mod fallback;
 mod fallback_planner;
+mod file_hash_rebuild;
 mod heartbeat;
 mod identity;
 mod incremental_policy;

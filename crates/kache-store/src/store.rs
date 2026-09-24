@@ -986,6 +986,10 @@ pub struct GcStats {
     /// in a worktree). Distinct from [`Self::entries_pinned`].
     #[serde(default)]
     pub entries_unreclaimable: usize,
+    /// Bytes of the entries a size sweep found unreclaimable, measured before
+    /// it evicted and left out of its size pressure. 0 when no size sweep ran.
+    #[serde(default)]
+    pub unreclaimable_bytes: u64,
     /// Best-effort private bytes actually returned by unlinking store names.
     #[serde(default)]
     pub disk_bytes_reclaimed: u64,
@@ -1024,6 +1028,31 @@ pub struct GcStats {
     pub housekeeping: Option<HousekeepingStats>,
 }
 
+/// What eviction cannot free while clones outside the store hold blocks:
+/// every blob such a clone holds, whatever its refcount, and the other
+/// last-reference blobs of the entries eviction must keep for it.
+#[derive(Debug, Default)]
+struct Unreclaimable {
+    /// Entries holding the last references to a retained blob.
+    keys: std::collections::HashSet<String>,
+    /// Kept blobs by hash, each counted once.
+    blobs: std::collections::HashMap<String, u64>,
+}
+
+impl Unreclaimable {
+    fn bytes(&self) -> u64 {
+        self.blobs.values().sum()
+    }
+
+    /// Add `blobs` an entry keeps; returns the bytes not counted before.
+    fn keep(&mut self, blobs: Vec<(String, u64)>) -> u64 {
+        blobs
+            .into_iter()
+            .filter_map(|(hash, size)| self.blobs.insert(hash, size).is_none().then_some(size))
+            .sum()
+    }
+}
+
 /// Counts from [`Store::sweep_housekeeping`], recorded with the GC run so
 /// growth in either structure shows up without a shell on the host.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1034,6 +1063,7 @@ pub struct HousekeepingStats {
     pub key_locks_remaining: usize,
     pub predictions_pruned: usize,
     /// File hash memo rows deleted as not written for a month (#1206).
+    #[serde(default)]
     pub file_hashes_pruned: usize,
 }
 
@@ -1090,8 +1120,9 @@ enum RemovalAttempt {
     Done(Option<RemovalReclaim>),
     Republished,
     /// Last-ref blobs are still cloned outside the store; eviction must not
-    /// drop the entry (kunobi-ninja/kache#725).
-    Unreclaimable,
+    /// drop the entry (kunobi-ninja/kache#725). Carries the blobs the entry
+    /// keeps, by hash and size.
+    Unreclaimable(Vec<(String, u64)>),
 }
 
 /// Outcome of removing an entry while holding its compile lock.
@@ -1099,7 +1130,9 @@ enum RemovalAttempt {
 pub enum GuardedRemoval {
     Reclaimed(RemovalReclaim),
     Skipped,
-    Unreclaimable,
+    /// Kept for a clone outside the store. Carries the blobs the entry keeps:
+    /// the retained ones and its other last-reference blobs, by hash and size.
+    Unreclaimable(Vec<(String, u64)>),
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1160,6 +1193,28 @@ impl BlobIndexDrift {
         self.entry_mappings + self.blobs
     }
 }
+
+/// A blob index reconcile reached its deadline before it had read every
+/// committed entry. The transaction was rolled back; nothing changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconcileOutOfTime {
+    /// Committed entries whose metadata was read in time.
+    pub read: usize,
+    /// Committed entries the reconcile had to read.
+    pub total: usize,
+}
+
+impl std::fmt::Display for ReconcileOutOfTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "blob index reconcile reached its deadline after reading {} of {} entries",
+            self.read, self.total
+        )
+    }
+}
+
+impl std::error::Error for ReconcileOutOfTime {}
 
 #[derive(Default)]
 struct AuthoritativeBlobIndex {
@@ -1801,7 +1856,10 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
 ///    two units of one crate name apart (every build script is one name).
 /// 6: `entries.imported_at`, so automatic eviction can keep what the remote
 ///    delivered for the job still running (#1008).
-const INDEX_SCHEMA_GENERATION: i64 = 6;
+/// 7: a new `file_hashes` is `WITHOUT ROWID`, and the `updated_at` index
+///    the first file hash prune built is dropped. An existing table is
+///    rebuilt off the build path (#1206).
+const INDEX_SCHEMA_GENERATION: i64 = 7;
 
 /// Raise the refcount of every blob `cache_key` maps to at least the
 /// references all mappings hold on it. Run before giving this key's
@@ -3164,7 +3222,14 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// Read the authoritative blob reference graph from committed entry
     /// metadata. The caller must hold SQLite's write lock so a publisher or
     /// remover cannot change the row/meta pairing during the scan (#819).
-    fn authoritative_blob_index(&self, conn: &Connection) -> Result<AuthoritativeBlobIndex> {
+    ///
+    /// Stops with [`ReconcileOutOfTime`] once `deadline` has passed, so a
+    /// caller holding the write lock can bound how long it holds it.
+    fn authoritative_blob_index(
+        &self,
+        conn: &Connection,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<AuthoritativeBlobIndex> {
         let keys: Vec<String> = {
             let mut stmt = conn
                 .prepare("SELECT cache_key FROM entries WHERE committed = 1 ORDER BY cache_key")?;
@@ -3172,7 +3237,16 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 .collect::<Result<Vec<_>, _>>()?
         };
         let mut index = AuthoritativeBlobIndex::default();
-        for key in keys {
+        let total = keys.len();
+        for (read, key) in keys.into_iter().enumerate() {
+            let past_deadline = deadline.is_some_and(|deadline| {
+                std::time::Instant::now()
+                    .checked_duration_since(deadline)
+                    .is_some()
+            });
+            if past_deadline {
+                return Err(ReconcileOutOfTime { read, total }.into());
+            }
             let meta_path = self.entry_dir(&key).join("meta.json");
             let content = fs::read_to_string(&meta_path)
                 .with_context(|| format!("entry {key}: reading authoritative meta.json"))?;
@@ -3269,7 +3343,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     pub fn blob_index_drift(&self) -> Result<BlobIndexDrift> {
         self.db.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
-            let expected = self.authoritative_blob_index(&self.db)?;
+            let expected = self.authoritative_blob_index(&self.db, None)?;
             let actual = self.indexed_blob_graph(&self.db)?;
             Ok(Self::compare_blob_indexes(&expected, &actual))
         })();
@@ -3296,9 +3370,19 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// Physical orphan reclamation deliberately happens after this transaction
     /// through [`Self::sweep_orphan_blobs`], never while SQL can roll back.
     pub fn reconcile_blob_index(&self) -> Result<BlobIndexDrift> {
+        self.reconcile_blob_index_by(None)
+    }
+
+    /// [`Self::reconcile_blob_index`] that gives up at `deadline`: the
+    /// metadata scan stops with [`ReconcileOutOfTime`] and the transaction
+    /// rolls back. The rewrite after the scan is not interrupted.
+    pub fn reconcile_blob_index_by(
+        &self,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<BlobIndexDrift> {
         self.db.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> Result<BlobIndexDrift> {
-            let expected = self.authoritative_blob_index(&self.db)?;
+            let expected = self.authoritative_blob_index(&self.db, deadline)?;
             let actual = self.indexed_blob_graph(&self.db)?;
             let drift = Self::compare_blob_indexes(&expected, &actual);
             if drift.total() == 0 {
@@ -3930,8 +4014,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     }
 
     /// The per-key structures nothing else bounds: stale key lock files,
-    /// unused input predictions and old file hash rows. The caller holds `gc.lock`. A pass that fails
-    /// is logged and counts as zero; the next sweep tries again.
+    /// unused input predictions and old memoised file hashes. The caller holds
+    /// `gc.lock`. A pass that fails is logged and counts as zero; the next
+    /// sweep tries again.
     pub fn sweep_housekeeping(&self) -> HousekeepingStats {
         let locks = self
             .sweep_stale_key_locks(KEY_LOCK_SWEEP_GRACE, KEY_LOCK_SWEEP_CAP)
@@ -4109,6 +4194,74 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     row.get(0)
                 })?;
         Ok(size as u64)
+    }
+
+    /// The size automatic GC triggers on: [`Self::physical_size`] minus the
+    /// bytes the last size sweep found no eviction could free, while that
+    /// measurement is current (see [`crate::UNRECLAIMABLE_RECORD_TTL`]).
+    pub fn size_pressure(&self) -> Result<u64> {
+        let unreclaimable = crate::pressure::recorded_unreclaimable(
+            &self.config.cache_dir,
+            crate::pressure::unix_now_secs(),
+        );
+        Ok(self.physical_size()?.saturating_sub(unreclaimable))
+    }
+
+    /// What eviction cannot free now: every blob a clone or hardlink outside
+    /// the store holds, whatever its refcount, and the entries holding the
+    /// last references to one of them, with their other last-reference
+    /// blobs. Mirrors the guard in `remove_entry_attempt`, read from the blob
+    /// index rather than from each `meta.json`. Entries not yet mapped in
+    /// `entry_blobs` are not seen.
+    fn measure_unreclaimable(&self) -> Result<Unreclaimable> {
+        if self.config.gc_evict_shared {
+            return Ok(Unreclaimable::default());
+        }
+        // Read to the end before probing, so the read transaction does not
+        // stay open for the probes and hold back WAL checkpoints.
+        let rows: Vec<(String, String, i64, bool)> = self
+            .db
+            .prepare(
+                "SELECT eb.cache_key, eb.hash, b.size,
+                        b.refcount > 0 AND b.refcount <= eb.refs
+                 FROM entry_blobs eb JOIN blobs b ON b.hash = eb.hash",
+            )?
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut retained: std::collections::HashMap<&str, bool> = std::collections::HashMap::new();
+        /// An entry's last-reference blobs, and whether one is retained.
+        #[derive(Default)]
+        struct LastReferences {
+            blobs: Vec<(String, u64)>,
+            blocked: bool,
+        }
+        let mut entries: std::collections::HashMap<&str, LastReferences> =
+            std::collections::HashMap::new();
+        let mut unreclaimable = Unreclaimable::default();
+        for (key, hash, size, last_reference) in &rows {
+            let size = (*size).max(0) as u64;
+            // A blob shared by several entries is probed once.
+            let held_outside = *retained.entry(hash.as_str()).or_insert_with(|| {
+                crate::filesystem::blob_has_external_retainer(&self.blob_path(hash))
+            });
+            if held_outside {
+                unreclaimable.blobs.insert(hash.clone(), size);
+            }
+            if *last_reference {
+                let entry = entries.entry(key.as_str()).or_default();
+                entry.blobs.push((hash.clone(), size));
+                entry.blocked |= held_outside;
+            }
+        }
+        for (key, entry) in entries {
+            if entry.blocked {
+                unreclaimable.keys.insert(key.to_string());
+                unreclaimable.keep(entry.blobs);
+            }
+        }
+        Ok(unreclaimable)
     }
 
     /// Get the number of entries in the store.
@@ -4446,6 +4599,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         stop_at: Option<(u64, u64)>,
         shadow: Option<&ShadowSelection>,
         durable_upload_keys: &std::collections::HashSet<String>,
+        unreclaimable: &mut Unreclaimable,
     ) -> GcStats {
         let mut stats = GcStats::default();
         let mut eviction_writes = std::time::Duration::ZERO;
@@ -4461,6 +4615,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 && current_size <= target
             {
                 break;
+            }
+            // Measured just before the walk, and counted by the caller. The
+            // removal would probe the same blobs and refuse the same way.
+            if unreclaimable.keys.contains(key) {
+                continue;
             }
             if durable_upload_keys.contains(key) {
                 stats.entries_pinned += 1;
@@ -4524,8 +4683,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     stats.entries_pinned += 1;
                     continue;
                 }
-                Ok(GuardedRemoval::Unreclaimable) => {
+                // Linked since the measurement, or the last holder of a blob
+                // shared with entries removed earlier in this walk. Its bytes
+                // stay, so they leave the pressure too.
+                Ok(GuardedRemoval::Unreclaimable(kept)) => {
                     stats.entries_unreclaimable += 1;
+                    unreclaimable.keys.insert(key.clone());
+                    current_size = current_size.saturating_sub(unreclaimable.keep(kept));
                     continue;
                 }
                 Err(e) => {
@@ -4560,6 +4724,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         policy: &dyn crate::eviction::EvictionPolicy,
         stop_at: Option<(u64, u64)>,
         origin: SweepOrigin,
+        unreclaimable: &mut Unreclaimable,
     ) -> Result<GcStats> {
         let candidates = self.eviction_candidates_for(origin)?;
         let order = policy.select(&candidates);
@@ -4606,6 +4771,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             stop_at,
             shadow.as_ref(),
             &durable_upload_keys,
+            unreclaimable,
         ))
     }
 
@@ -4629,23 +4795,51 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // dedup-heavy store the logical figure over-reports by exactly the
         // dedup savings, firing GC while the disk is comfortable and
         // destroying rebuild value without reclaiming space (#608).
-        let size_before = self.physical_size()?;
-        if !crate::eviction::over_eviction_trigger(size_before, self.config.max_size) {
+        let physical = self.physical_size()?;
+        if !crate::eviction::over_eviction_trigger(physical, self.config.max_size) {
             return Ok(GcStats::default());
         }
-
-        // The ranking is computed once and walked while deleting: each entry's
-        // score is independent of the others, so the order stays valid as rows
-        // disappear. The walk subtracts the bytes each removal actually freed
-        // (last-reference blobs), so the stop condition tracks the physical
-        // store without re-querying. A removal that frees less than its
-        // ranked `reclaimable_bytes` promised (a twin evicted earlier in the
-        // same sweep) only makes the sweep continue longer — never stop early.
-        self.evict_with(
-            &crate::eviction::SizePressurePolicy,
-            Some((size_before, target)),
-            origin,
-        )
+        // Bytes still cloned into target directories cannot be freed, so
+        // they are left out of the pressure. Counted in, they made the target
+        // unreachable and the walk evicted every freeable entry (#1206).
+        let mut unreclaimable = self.measure_unreclaimable()?;
+        let measured_entries = unreclaimable.keys.len();
+        let measured_bytes = unreclaimable.bytes();
+        let now = crate::pressure::unix_now_secs();
+        crate::pressure::record_unreclaimable(&self.config.cache_dir, measured_bytes, now);
+        let pressure = physical.saturating_sub(measured_bytes);
+        let mut stats = if crate::eviction::over_eviction_trigger(pressure, self.config.max_size) {
+            // The ranking is computed once and walked while deleting: each
+            // entry's score is independent of the others, so the order
+            // stays valid as rows disappear. The walk subtracts the bytes
+            // each removal actually freed (last-reference blobs), so the
+            // stop condition tracks the physical store without
+            // re-querying. A removal that frees less than its ranked
+            // `reclaimable_bytes` promised (a twin evicted earlier in the
+            // same sweep) only makes the sweep continue longer — never
+            // stop early.
+            self.evict_with(
+                &crate::eviction::SizePressurePolicy,
+                Some((pressure, target)),
+                origin,
+                &mut unreclaimable,
+            )?
+        } else {
+            GcStats::default()
+        };
+        // Refusals during the walk add to what was measured.
+        if unreclaimable.bytes() != measured_bytes {
+            crate::pressure::record_unreclaimable(
+                &self.config.cache_dir,
+                unreclaimable.bytes(),
+                now,
+            );
+        }
+        // Every entry is a size-pressure candidate, so each measured one was
+        // left in place, whether or not the walk reached it.
+        stats.entries_unreclaimable += measured_entries;
+        stats.unreclaimable_bytes = unreclaimable.bytes();
+        Ok(stats)
     }
 
     /// Evict entries older than the given duration.
@@ -4654,6 +4848,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             &crate::eviction::OlderThanPolicy { hours },
             None,
             SweepOrigin::Requested,
+            &mut Unreclaimable::default(),
         )
     }
 
@@ -4687,6 +4882,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             None,
             None,
             &durable_upload_keys,
+            &mut Unreclaimable::default(),
         ))
     }
 
@@ -4706,7 +4902,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
 
     /// [`Self::evict_duplicate_entries`] for a sweep started by `origin`.
     pub fn evict_duplicate_entries_for(&self, origin: SweepOrigin) -> Result<GcStats> {
-        let size_before = self.physical_size()?;
+        let size_before = self.size_pressure()?;
         if !crate::eviction::over_eviction_trigger(size_before, self.config.max_size) {
             return Ok(GcStats {
                 skipped: true,
@@ -4720,6 +4916,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 crate::eviction::eviction_target(self.config.max_size),
             )),
             origin,
+            &mut Unreclaimable::default(),
         )
     }
 
@@ -5188,7 +5385,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     return Ok(GuardedRemoval::Reclaimed(reclaim));
                 }
                 RemovalAttempt::Done(None) => return Ok(GuardedRemoval::Skipped),
-                RemovalAttempt::Unreclaimable => return Ok(GuardedRemoval::Unreclaimable),
+                RemovalAttempt::Unreclaimable(kept) => {
+                    return Ok(GuardedRemoval::Unreclaimable(kept));
+                }
                 // A republication landed while this attempt waited out a
                 // concurrent removal: the row belongs to a fresh generation
                 // whose meta is back. The caller asked to remove whatever is
@@ -5324,15 +5523,15 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // None` and still unlinks. The filesystem probe runs before the write
         // lock is taken: the lock does not stop a restore from linking a
         // blob, so probing under it adds no safety and keeps builds waiting.
+        let mut held_refs: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
+        for hash in &hashes {
+            *held_refs.entry(hash.as_str()).or_insert(0) += 1;
+        }
         let retained_blobs: Vec<(&str, i64)> =
             if skip_if_idle_lt.is_some() && !self.config.gc_evict_shared {
-                let mut held_refs: std::collections::HashMap<&str, i64> =
-                    std::collections::HashMap::new();
-                for hash in &hashes {
-                    *held_refs.entry(hash.as_str()).or_insert(0) += 1;
-                }
                 held_refs
-                    .into_iter()
+                    .iter()
+                    .map(|(hash, held)| (*hash, *held))
                     .filter(|(hash, _)| {
                         crate::filesystem::blob_has_external_retainer(&self.blob_path(hash))
                     })
@@ -5371,15 +5570,35 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
 
         // A blob found retained above blocks the removal only while this
         // entry holds its last references, and that needs the lock.
-        for (hash, held) in retained_blobs {
-            let rc: i64 = tx.query_row(
-                "SELECT refcount FROM blobs WHERE hash = ?1",
+        let blob_row = |hash: &str| -> rusqlite::Result<Option<(i64, i64)>> {
+            tx.query_row(
+                "SELECT refcount, size FROM blobs WHERE hash = ?1",
                 params![hash],
-                |row| row.get(0),
-            )?;
-            if holds_last_reference(rc, held) {
-                return Ok(RemovalAttempt::Unreclaimable);
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+        };
+        let mut blocked = false;
+        for (hash, held) in &retained_blobs {
+            if blob_row(hash)?.is_some_and(|(rc, _)| holds_last_reference(rc, *held)) {
+                blocked = true;
+                break;
             }
+        }
+        if blocked {
+            // What stays with the entry: every retained blob, and every
+            // other blob it holds the last references to.
+            let mut kept = Vec::new();
+            for (hash, held) in &held_refs {
+                let Some((rc, size)) = blob_row(hash)? else {
+                    continue;
+                };
+                let retained = retained_blobs.iter().any(|(r, _)| r == hash);
+                if retained || holds_last_reference(rc, *held) {
+                    kept.push((hash.to_string(), size.max(0) as u64));
+                }
+            }
+            return Ok(RemovalAttempt::Unreclaimable(kept));
         }
 
         // Delete the entry row first. If rows_affected is 0, another remover
@@ -8099,8 +8318,31 @@ mod tests {
                 blobs: 2,
             }
         );
+        let error = store
+            .reconcile_blob_index_by(Some(std::time::Instant::now()))
+            .unwrap_err();
         assert_eq!(
-            store.reconcile_blob_index().unwrap(),
+            error.downcast_ref::<ReconcileOutOfTime>(),
+            Some(&ReconcileOutOfTime { read: 0, total: 2 })
+        );
+        assert_eq!(
+            error.to_string(),
+            "blob index reconcile reached its deadline after reading 0 of 2 entries"
+        );
+        assert_eq!(
+            store.blob_index_drift().unwrap(),
+            BlobIndexDrift {
+                entry_mappings: 1,
+                blobs: 2,
+            },
+            "a reconcile past its deadline changes nothing"
+        );
+        assert_eq!(
+            store
+                .reconcile_blob_index_by(Some(
+                    std::time::Instant::now() + std::time::Duration::from_secs(60)
+                ))
+                .unwrap(),
             BlobIndexDrift {
                 entry_mappings: 1,
                 blobs: 2,
@@ -9003,6 +9245,415 @@ mod tests {
         assert!(
             retainer.is_file(),
             "compatibility mode drops the store name, not the retained blocks"
+        );
+    }
+
+    /// Put an idle entry keyed `{n:064x}` whose one blob is `len` bytes of
+    /// `n`, so every `n` gets its own blob.
+    fn put_idle_sized_entry(store: &Store, dir: &Path, n: u8, len: usize) -> String {
+        let key = format!("{n:064x}");
+        let src = dir.join(format!("sized-{n}.rlib"));
+        std::fs::write(&src, vec![n; len]).unwrap();
+        store
+            .put(
+                &key,
+                "c",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(src.clone(), "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        let _ = std::fs::remove_file(&src);
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', '-1 hour') WHERE cache_key = ?1",
+                params![key],
+            )
+            .unwrap();
+        key
+    }
+
+    fn link_blobs_outside(store: &Store, dir: &Path, key: &str) {
+        let meta = store.get(key).unwrap().unwrap();
+        for file in &meta.files {
+            let retainer = dir.join(format!("target-{}", file.hash));
+            std::fs::hard_link(store.blob_path(&file.hash), retainer).unwrap();
+        }
+    }
+
+    /// #1206: bytes still linked into target directories count in
+    /// `SUM(blobs.size)` but no eviction frees them. Counted in, they kept
+    /// the store over its limit, and the sweep evicted every freeable entry
+    /// while chasing a target it could not reach.
+    #[test]
+    fn evict_leaves_linked_bytes_out_of_size_pressure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 1000;
+        let store = Store::open(&config).unwrap();
+        let linked = put_idle_sized_entry(&store, dir.path(), 1, 1500);
+        link_blobs_outside(&store, dir.path(), &linked);
+        let free: Vec<String> = (2..4)
+            .map(|n| put_idle_sized_entry(&store, dir.path(), n, 200))
+            .collect();
+        assert_eq!(store.physical_size().unwrap(), 1900);
+        assert_eq!(store.size_pressure().unwrap(), 1900, "nothing measured yet");
+
+        let stats = store.evict().unwrap();
+        assert_eq!(
+            stats.entries_evicted, 0,
+            "400 freeable bytes fit: {stats:?}"
+        );
+        assert_eq!(stats.entries_unreclaimable, 1, "{stats:?}");
+        assert_eq!(stats.unreclaimable_bytes, 1500, "{stats:?}");
+        assert!(free.iter().all(|key| store.contains(key)));
+        assert!(store.contains(&linked));
+        assert_eq!(
+            store.size_pressure().unwrap(),
+            400,
+            "the triggers leave the measured bytes out"
+        );
+    }
+
+    #[test]
+    fn evict_stops_at_the_target_measured_without_linked_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 1000;
+        let store = Store::open(&config).unwrap();
+        let linked = put_idle_sized_entry(&store, dir.path(), 1, 600);
+        link_blobs_outside(&store, dir.path(), &linked);
+        let free: Vec<String> = (2..8)
+            .map(|n| put_idle_sized_entry(&store, dir.path(), n, 200))
+            .collect();
+
+        let stats = store.evict().unwrap();
+        // 1200 freeable bytes against a target of 900: two entries go. With
+        // the linked 600 counted, the target was 300 freeable bytes, and five
+        // of the six would have gone.
+        assert_eq!(stats.entries_evicted, 2, "{stats:?}");
+        assert_eq!(stats.entries_unreclaimable, 1, "{stats:?}");
+        assert_eq!(stats.unreclaimable_bytes, 600, "{stats:?}");
+        assert_eq!(free.iter().filter(|key| store.contains(key)).count(), 4);
+        assert!(store.contains(&linked));
+        assert_eq!(store.size_pressure().unwrap(), 800);
+    }
+
+    /// Put an idle entry keyed `{n:064x}` with one file per `(name, bytes)`.
+    fn put_idle_entry_with(store: &Store, dir: &Path, n: u8, files: &[(&str, Vec<u8>)]) -> String {
+        let key = format!("{n:064x}");
+        let outputs: Vec<(PathBuf, String)> = files
+            .iter()
+            .map(|(name, bytes)| {
+                let src = dir.join(format!("entry-{n}-{name}"));
+                std::fs::write(&src, bytes).unwrap();
+                (src, name.to_string())
+            })
+            .collect();
+        store
+            .put(&key, "c", &["lib".into()], &[], "", "dev", &outputs, "", "")
+            .unwrap();
+        for (src, _) in &outputs {
+            let _ = std::fs::remove_file(src);
+        }
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', '-1 hour') WHERE cache_key = ?1",
+                params![key],
+            )
+            .unwrap();
+        key
+    }
+
+    /// Two entries sharing one blob a target directory links, each with a
+    /// private blob of its own.
+    fn put_pair_sharing_a_linked_blob(store: &Store, dir: &Path) -> (String, String) {
+        let shared = vec![1u8; 600];
+        let a = put_idle_entry_with(
+            store,
+            dir,
+            1,
+            &[("shared.rlib", shared.clone()), ("a.rmeta", vec![2u8; 100])],
+        );
+        let b = put_idle_entry_with(
+            store,
+            dir,
+            2,
+            &[("shared.rlib", shared), ("b.rmeta", vec![3u8; 100])],
+        );
+        let shared = store.get(&a).unwrap().unwrap().files[0].hash.clone();
+        std::fs::hard_link(store.blob_path(&shared), dir.join("target-shared.rlib")).unwrap();
+        // `get` counts as an access.
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
+                [],
+            )
+            .unwrap();
+        (a, b)
+    }
+
+    /// A linked blob two entries share has no entry holding its last
+    /// reference, and an entry-level measurement missed it: the sweep then
+    /// chased its bytes and evicted freeable entries it did not need to.
+    #[test]
+    fn evict_leaves_a_shared_linked_blob_out_of_size_pressure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 1000;
+        let store = Store::open(&config).unwrap();
+        let (a, b) = put_pair_sharing_a_linked_blob(&store, dir.path());
+        let free: Vec<String> = (10..15)
+            .map(|n| put_idle_sized_entry(&store, dir.path(), n, 200))
+            .collect();
+        assert_eq!(store.physical_size().unwrap(), 1800);
+
+        let stats = store.evict().unwrap();
+        // 1200 bytes of pressure against a target of 900: 300 must go, and
+        // no removal frees more than 200.
+        assert!(
+            stats.bytes_freed >= 300 && stats.bytes_freed < 500,
+            "{stats:?}"
+        );
+        assert!(stats.unreclaimable_bytes >= 600, "{stats:?}");
+        assert!(
+            store.contains(&a) || store.contains(&b),
+            "the last holder of the linked blob stays"
+        );
+        assert!(free.iter().filter(|key| store.contains(key)).count() >= 3);
+    }
+
+    #[test]
+    fn a_shared_linked_blob_is_measured_whoever_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 500;
+        let store = Store::open(&config).unwrap();
+        let (a, b) = put_pair_sharing_a_linked_blob(&store, dir.path());
+
+        // Shared: neither entry is stuck, but the blob's bytes stay.
+        let stats = store.evict().unwrap();
+        assert_eq!(
+            stats.entries_evicted, 0,
+            "200 freeable bytes fit: {stats:?}"
+        );
+        assert_eq!(stats.entries_unreclaimable, 0, "{stats:?}");
+        assert_eq!(stats.unreclaimable_bytes, 600, "{stats:?}");
+
+        // Once b holds the last reference, its private blob stays too.
+        store.remove_entry(&a).unwrap();
+        let stats = store.evict().unwrap();
+        assert_eq!(stats.entries_unreclaimable, 1, "{stats:?}");
+        assert_eq!(stats.unreclaimable_bytes, 700, "{stats:?}");
+        assert!(store.contains(&b));
+    }
+
+    /// The walk can make an entry unreclaimable itself: removing one holder
+    /// of a shared linked blob leaves the other holding its last reference.
+    /// That entry's bytes leave the pressure at once, and the record says so.
+    #[test]
+    fn a_refusal_during_the_walk_leaves_its_bytes_out_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 100;
+        let store = Store::open(&config).unwrap();
+        let (a, b) = put_pair_sharing_a_linked_blob(&store, dir.path());
+
+        let stats = store.evict().unwrap();
+        assert_eq!(stats.entries_evicted, 1, "{stats:?}");
+        assert_eq!(stats.entries_unreclaimable, 1, "{stats:?}");
+        assert_eq!(stats.unreclaimable_bytes, 700, "{stats:?}");
+        assert!(store.contains(&a) != store.contains(&b));
+        assert_eq!(store.physical_size().unwrap(), 700);
+        assert_eq!(store.size_pressure().unwrap(), 0, "recorded after the walk");
+    }
+
+    /// Builds keep storing and restoring while size sweeps measure and
+    /// evict. Whatever interleaving the run gets, the blob index stays
+    /// consistent with the entries, every entry left restores, and no linked
+    /// entry is evicted.
+    #[test]
+    fn size_sweeps_racing_builds_keep_the_index_consistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.deferred_durability = true;
+        config.max_size = 3000;
+        let store = Store::open(&config).unwrap();
+        let linked: Vec<String> = (1..7)
+            .map(|n| {
+                let key = put_idle_sized_entry(&store, dir.path(), n, 200);
+                link_blobs_outside(&store, dir.path(), &key);
+                key
+            })
+            .collect();
+        for n in 10..30 {
+            put_idle_sized_entry(&store, dir.path(), n, 200);
+        }
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
+                [],
+            )
+            .unwrap();
+
+        let builds: Vec<_> = [100u8, 170]
+            .into_iter()
+            .map(|first| {
+                let config = config.clone();
+                let dir = dir.path().to_path_buf();
+                std::thread::spawn(move || {
+                    let build = Store::open(&config).unwrap();
+                    for n in first..first + 60 {
+                        put_idle_sized_entry(&build, &dir, n, 200);
+                        let _ = build.get(&format!("{:064x}", n - 1)).unwrap();
+                        let _ = build.get(&format!("{:064x}", 10 + n % 20)).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for _ in 0..3 {
+            store.evict().unwrap();
+        }
+        for build in builds {
+            build.join().unwrap();
+        }
+        let stats = store.evict().unwrap();
+
+        assert!(store.blob_refcount_drift().unwrap().is_clean());
+        assert_eq!(store.blob_index_drift().unwrap(), BlobIndexDrift::default());
+        assert!(linked.iter().all(|key| store.contains(key)));
+        assert!(stats.unreclaimable_bytes >= 1200, "{stats:?}");
+        let keys: Vec<String> = store
+            .db
+            .prepare("SELECT cache_key FROM entries")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for key in keys {
+            let meta = store.get(&key).unwrap().expect("a listed entry restores");
+            for file in &meta.files {
+                assert!(
+                    store.blob_path(&file.hash).is_file(),
+                    "{key}: {}",
+                    file.hash
+                );
+            }
+        }
+    }
+
+    /// After the build output goes, the recorded bytes still leave the
+    /// pressure until the record expires. The next sweep then measures again
+    /// and evicts what became freeable.
+    #[test]
+    fn linked_bytes_count_again_once_the_output_is_gone_and_the_record_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 1000;
+        let store = Store::open(&config).unwrap();
+        let linked = put_idle_sized_entry(&store, dir.path(), 1, 1500);
+        link_blobs_outside(&store, dir.path(), &linked);
+        store.evict().unwrap();
+        assert!(store.contains(&linked));
+
+        let hash = store.get(&linked).unwrap().unwrap().files[0].hash.clone();
+        std::fs::remove_file(dir.path().join(format!("target-{hash}"))).unwrap();
+        store.set_last_accessed_for_test(&linked, "-1 hour");
+        assert_eq!(store.size_pressure().unwrap(), 0, "the record still holds");
+
+        let expired = crate::pressure::unix_now_secs() - crate::UNRECLAIMABLE_RECORD_TTL.as_secs();
+        crate::pressure::record_unreclaimable(dir.path(), 1500, expired);
+        assert_eq!(store.size_pressure().unwrap(), 1500);
+        let stats = store.evict().unwrap();
+        assert_eq!(stats.entries_evicted, 1, "{stats:?}");
+        assert_eq!(stats.unreclaimable_bytes, 0, "{stats:?}");
+        assert!(!store.contains(&linked));
+    }
+
+    /// A refused entry keeps its retained blobs and its other last-reference
+    /// blobs. A blob it shares with an entry that stays is not among them:
+    /// the other entry keeps it anyway, and counting it would take it from
+    /// the pressure twice.
+    #[test]
+    fn a_refused_entry_reports_only_the_blobs_it_keeps() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let (a, b) = put_pair_sharing_a_linked_blob(&store, dir.path());
+        let shared_with_d = vec![4u8; 50];
+        put_idle_entry_with(&store, dir.path(), 3, &[("d.rlib", shared_with_d.clone())]);
+        store.remove_entry(&b).unwrap();
+        // `a` now holds the linked blob's last reference. Give it a blob it
+        // shares with `d` as well.
+        let c = put_idle_entry_with(
+            &store,
+            dir.path(),
+            5,
+            &[
+                ("shared.rlib", vec![1u8; 600]),
+                ("a.rmeta", vec![2u8; 100]),
+                ("d.rlib", shared_with_d),
+            ],
+        );
+        store.remove_entry(&a).unwrap();
+
+        let kept = match store
+            .remove_entry_guarded(&c, Some(Duration::from_secs(1)))
+            .unwrap()
+        {
+            GuardedRemoval::Unreclaimable(kept) => kept,
+            other => panic!("{other:?}"),
+        };
+        let mut sizes: Vec<u64> = kept.iter().map(|(_, size)| *size).collect();
+        sizes.sort_unstable();
+        assert_eq!(
+            sizes,
+            [100, 600],
+            "the blob shared with d is not kept for c"
+        );
+        assert!(store.contains(&c));
+    }
+
+    #[test]
+    fn evict_under_the_trigger_measures_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 1000;
+        let store = Store::open(&config).unwrap();
+        let linked = put_idle_sized_entry(&store, dir.path(), 1, 600);
+        link_blobs_outside(&store, dir.path(), &linked);
+
+        let stats = store.evict().unwrap();
+        assert_eq!(stats.unreclaimable_bytes, 0, "{stats:?}");
+        assert_eq!(stats.entries_unreclaimable, 0, "{stats:?}");
+        assert_eq!(store.size_pressure().unwrap(), 600);
+    }
+
+    #[test]
+    fn duplicate_eviction_triggers_on_the_recorded_pressure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 1000;
+        let store = Store::open(&config).unwrap();
+        let linked = put_idle_sized_entry(&store, dir.path(), 1, 1500);
+        link_blobs_outside(&store, dir.path(), &linked);
+        assert!(
+            !store.evict_duplicate_entries().unwrap().skipped,
+            "no measurement yet, so the physical size counts"
+        );
+        store.evict().unwrap();
+        assert!(
+            store.evict_duplicate_entries().unwrap().skipped,
+            "the measured 1500 bytes leave no pressure"
         );
     }
 
@@ -17164,7 +17815,9 @@ mod tests {
     /// Deciding that an entry cannot be reclaimed also takes the write lock,
     /// so the sweep paces those entries like removals. It used to move to the
     /// next one at once, and a run of entries still linked into target
-    /// directories took the lock back to back.
+    /// directories took the lock back to back. A size sweep measures such
+    /// entries before it walks and never offers them for removal; this covers
+    /// the ones linked after that measurement.
     #[test]
     fn eviction_paces_entries_it_cannot_reclaim() {
         let dir = tempfile::tempdir().unwrap();
@@ -17193,14 +17846,31 @@ mod tests {
         // A zero slice pauses after every entry that took the lock.
         let pause = Duration::from_millis(150);
         gc.eviction_pacing = (Duration::ZERO, pause);
+        let physical = gc.physical_size().unwrap();
         let started = std::time::Instant::now();
-        let stats = gc.evict().unwrap();
+        let stats = gc
+            .evict_with(
+                &crate::eviction::SizePressurePolicy,
+                Some((physical, 0)),
+                SweepOrigin::Requested,
+                &mut Unreclaimable::default(),
+            )
+            .unwrap();
         let elapsed = started.elapsed();
 
         assert_eq!(stats.entries_unreclaimable, 3, "{stats:?}");
         assert!(
             elapsed >= pause * 3,
             "one pause per entry, swept in {elapsed:?}"
+        );
+
+        let started = std::time::Instant::now();
+        let stats = gc.evict().unwrap();
+        assert_eq!(stats.entries_unreclaimable, 3, "{stats:?}");
+        assert_eq!(stats.unreclaimable_bytes, physical, "{stats:?}");
+        assert!(
+            started.elapsed() < pause,
+            "measured entries take no lock and no pause"
         );
     }
 
