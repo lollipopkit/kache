@@ -312,7 +312,7 @@ impl FileHashCache<'_> {
     /// over half a minute, and builds failed on their 5 s busy timeout.
     pub fn prune_file_hashes(&self) -> rusqlite::Result<usize> {
         let deadline = std::time::Instant::now() + FILE_HASH_PRUNE_BUDGET;
-        self.prune_file_hashes_until(unix_now(), FILE_HASH_PRUNE_CAP, deadline)
+        self.prune_file_hashes_until(unix_now(), FILE_HASH_PRUNE_CAP, deadline, || {})
     }
 
     /// Prune `cap` rows at a time until a read comes back short or
@@ -322,19 +322,23 @@ impl FileHashCache<'_> {
         now: i64,
         cap: usize,
         deadline: std::time::Instant,
+        mut after_read: impl FnMut(),
     ) -> rusqlite::Result<usize> {
         let mut removed = 0;
         loop {
-            let batch = self.prune_file_hashes_at(now, cap)?;
-            removed += batch;
-            if batch < cap || std::time::Instant::now() >= deadline {
+            let batch = self.prune_file_hashes_with_hook(now, cap, &mut after_read)?;
+            removed += batch.removed;
+            // Decided on the rows read: rows a build refreshed since are
+            // kept, and do not mean the expired ones ran out.
+            if batch.selected < cap || std::time::Instant::now() >= deadline {
                 return Ok(removed);
             }
         }
     }
 
+    #[cfg(test)]
     fn prune_file_hashes_at(&self, now: i64, cap: usize) -> rusqlite::Result<usize> {
-        self.prune_file_hashes_with_hook(now, cap, || {})
+        Ok(self.prune_file_hashes_with_hook(now, cap, || {})?.removed)
     }
 
     /// [`Self::prune_file_hashes_at`] with a test seam between the read and
@@ -344,7 +348,7 @@ impl FileHashCache<'_> {
         now: i64,
         cap: usize,
         after_read: impl FnOnce(),
-    ) -> rusqlite::Result<usize> {
+    ) -> rusqlite::Result<PruneBatch> {
         let cutoff = now.saturating_sub(FILE_HASH_RETENTION_SECS);
         // Found with a plain read, which takes no write lock. The deletes
         // then take it once per chunk, so a build waits for one chunk at most.
@@ -374,8 +378,19 @@ impl FileHashCache<'_> {
                 .db()
                 .execute(&sql, rusqlite::params_from_iter(params))?;
         }
-        Ok(removed)
+        Ok(PruneBatch {
+            selected: stale.len(),
+            removed,
+        })
     }
+}
+
+/// One read of expired file hash rows and the deletes that followed it.
+struct PruneBatch {
+    /// Expired when read.
+    selected: usize,
+    /// Still expired when deleted.
+    removed: usize,
 }
 
 /// How long a file hash row is kept after it was last written. The memo is
@@ -1276,12 +1291,44 @@ mod tests {
         put_file_hash_recorded_at(&cache, "/fresh", now);
 
         let past = std::time::Instant::now();
-        assert_eq!(cache.prune_file_hashes_until(now, 3, past).unwrap(), 3);
+        assert_eq!(
+            cache.prune_file_hashes_until(now, 3, past, || {}).unwrap(),
+            3
+        );
         assert_eq!(file_hash_paths(&cache).len(), 8, "out of time: one read");
 
         let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        assert_eq!(cache.prune_file_hashes_until(now, 3, later).unwrap(), 7);
+        assert_eq!(
+            cache.prune_file_hashes_until(now, 3, later, || {}).unwrap(),
+            7
+        );
         assert_eq!(file_hash_paths(&cache), ["/fresh"]);
+    }
+
+    /// A read whose rows a build refreshed before the delete still counts
+    /// as full: the prune reads again rather than stop with expired rows left.
+    #[test]
+    fn prune_file_hashes_reads_again_after_a_refreshed_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        let now = 1_900_000_000;
+        for path in ["/a1", "/a2", "/b1", "/b2"] {
+            put_file_hash_recorded_at(&cache, path, 1);
+        }
+        let mut reads = 0;
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let removed = cache
+            .prune_file_hashes_until(now, 2, later, || {
+                reads += 1;
+                if reads == 1 {
+                    // The first read, in primary key order, took /a1 and /a2.
+                    put_file_hash_recorded_at(&cache, "/a1", now);
+                    put_file_hash_recorded_at(&cache, "/a2", now);
+                }
+            })
+            .unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(file_hash_paths(&cache), ["/a1", "/a2"]);
     }
 
     /// A build that records a path between the prune's read and its delete
@@ -1296,7 +1343,7 @@ mod tests {
         put_file_hash_recorded_at(&cache, "/old", 1);
 
         let build = FileHashCache::open(&db_path).unwrap();
-        let removed = cache
+        let batch = cache
             .prune_file_hashes_with_hook(now, FILE_HASH_PRUNE_CAP, || {
                 let fingerprint = FileFingerprint {
                     path: "/refreshed".to_string(),
@@ -1308,7 +1355,7 @@ mod tests {
                 build.put(&fingerprint, "new-hash").unwrap();
             })
             .unwrap();
-        assert_eq!(removed, 1);
+        assert_eq!((batch.selected, batch.removed), (2, 1));
         assert_eq!(file_hash_paths(&cache), ["/refreshed"]);
     }
 
