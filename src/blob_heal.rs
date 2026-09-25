@@ -1,16 +1,18 @@
-//! Daemon-side repair of blob-index drift, a step of [`crate::maintenance`].
+//! Daemon-side repair of blob-index drift, a step of [`crate::maintenance`]
+//! and of every daemon GC sweep.
 //!
 //! `blobs` and `entry_blobs` are derived from committed entries. When they
 //! drift, leaked refcounts keep bytes counted against `max_size` that no
 //! eviction can free. A SQL probe spots that; the repair rebuilds both tables
-//! from every committed `meta.json` under the index write lock, so it runs
-//! only while the machine is quiet. There is no forced fallback: the lock is
-//! held for as long as the metadata scan takes, which nothing bounds, and the
-//! drift costs disk budget, never a wrong hit.
+//! from every committed `meta.json` under the index write lock. Unbounded, it
+//! runs only while the machine is quiet. A host that is never quiet still
+//! gets the repair from its GC sweeps, which stop the metadata scan after
+//! [`GC_BUDGET`] and change nothing then (#1206). The drift costs disk
+//! budget, never a wrong hit.
 
 use crate::config::Config;
 use crate::maintenance::{Trigger, is_quiet, unix_now_secs};
-use crate::store::{BlobIndexDrift, BlobRefcountDrift, Store};
+use crate::store::{BlobIndexDrift, BlobRefcountDrift, ReconcileOutOfTime, Store};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -21,6 +23,12 @@ pub(crate) const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(6 * 3600);
 /// Most entries a shutdown repair reads. The scan opens every committed
 /// `meta.json`, and shutdown has to stay short.
 pub(crate) const SHUTDOWN_MAX_ENTRIES: u64 = 25_000;
+/// Longest a GC sweep's repair holds the index write lock for the metadata
+/// scan. Well under the wrappers' 5 s busy timeout, so a build that queues
+/// behind it waits instead of failing.
+pub(crate) const GC_BUDGET: Duration = Duration::from_secs(2);
+/// Longest a GC sweep's repair waits for the index write lock.
+const GC_LOCK_WAIT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SkipReason {
@@ -34,6 +42,8 @@ pub(crate) enum SkipReason {
     TooManyEntries,
     /// A GC holds `gc.lock`; the two must not overlap.
     GcRunning,
+    /// The last heal in a GC ran out of time on a store this size.
+    OutOfTimeRecently,
 }
 
 impl SkipReason {
@@ -44,6 +54,9 @@ impl SkipReason {
             SkipReason::BackingOff => "the last attempt failed; waiting before the next",
             SkipReason::TooManyEntries => "too many entries to read during shutdown",
             SkipReason::GcRunning => "a GC holds gc.lock",
+            SkipReason::OutOfTimeRecently => {
+                "the last heal in GC ran out of time on a store this size"
+            }
         }
     }
 }
@@ -127,6 +140,49 @@ fn clear_state(cache_dir: &Path) {
     let _ = std::fs::remove_file(state_path(cache_dir));
 }
 
+/// The last heal in a GC that ran out of time. Kept on disk for the same
+/// reason as [`FailedHeal`]: a CI daemon restarts per job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct GcOverrun {
+    /// Unix seconds.
+    at: u64,
+    /// Entries read before the budget ran out.
+    read: u64,
+}
+
+fn gc_overrun_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("blob-heal-gc.json")
+}
+
+fn read_gc_overrun(cache_dir: &Path) -> Option<GcOverrun> {
+    let json = std::fs::read(gc_overrun_path(cache_dir)).ok()?;
+    serde_json::from_slice(&json).ok()
+}
+
+fn record_gc_overrun(cache_dir: &Path, overrun: GcOverrun) {
+    if let Ok(json) = serde_json::to_vec(&overrun)
+        && let Err(error) = crate::atomic::atomic_replace(&gc_overrun_path(cache_dir), &json)
+    {
+        tracing::debug!("blob index heal: could not record the overrun: {error:#}");
+    }
+}
+
+fn clear_gc_overrun(cache_dir: &Path) {
+    let _ = std::fs::remove_file(gc_overrun_path(cache_dir));
+}
+
+/// Whether a GC skips the heal after `overrun`: for [`RETRY_AFTER_FAILURE`],
+/// while the store holds more entries than the overrun read in time. Each
+/// attempt would hold the write lock for the whole budget and change
+/// nothing. An overrun from the future does not count.
+fn gc_overrun_holds(overrun: Option<GcOverrun>, now: u64, entries: u64) -> bool {
+    overrun.is_some_and(|overrun| {
+        overrun.at <= now
+            && now - overrun.at < RETRY_AFTER_FAILURE.as_secs()
+            && entries > overrun.read
+    })
+}
+
 /// A failure from the future, after the clock went backwards, does not count.
 fn is_backing_off(failed_at: Option<u64>, now: u64) -> bool {
     failed_at.is_some_and(|at| at <= now && now - at < RETRY_AFTER_FAILURE.as_secs())
@@ -142,19 +198,35 @@ fn is_index_busy(error: &anyhow::Error) -> bool {
         .is_some_and(|code| matches!(code, DatabaseBusy | DatabaseLocked))
 }
 
+/// What happened to the blob files a repair left without a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Sweep {
+    /// Unlinked this many files holding this many bytes.
+    Swept { files: usize, bytes: u64 },
+    /// The sweep failed; the next GC retries it.
+    Failed,
+    /// Left to the orphan sweep of the GC the repair ran in.
+    LeftToGc,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Outcome {
     NotNeeded,
     Skipped(SkipReason),
     /// Another connection held the index; nothing was changed.
     IndexBusy,
+    /// A GC sweep's repair reached [`GC_BUDGET`] after reading `read` of
+    /// `total` entries. Nothing was changed.
+    OutOfTime {
+        read: usize,
+        total: usize,
+    },
     Healed {
         /// What the probe saw before the repair.
         probe: BlobRefcountDrift,
         /// Rows the rebuild found wrong against committed metadata.
         repaired: BlobIndexDrift,
-        /// Blob files unlinked afterwards, `None` when the sweep failed.
-        swept: Option<(usize, u64)>,
+        sweep: Sweep,
         elapsed: Duration,
     },
     /// The rebuild refused to run. Nothing was changed.
@@ -169,18 +241,26 @@ impl Outcome {
             Outcome::NotNeeded => "blob index heal not needed".to_string(),
             Outcome::Skipped(reason) => format!("blob index heal deferred: {}", reason.label()),
             Outcome::IndexBusy => "blob index heal found the index busy; will retry".to_string(),
+            Outcome::OutOfTime { read, total } => format!(
+                "blob index heal in GC stopped after {} s, having read {read} of {total} \
+                 entries, and changed nothing; GC skips it for {} h unless the store shrinks \
+                 to {read} entries, and it runs unbounded once builds are idle",
+                GC_BUDGET.as_secs(),
+                RETRY_AFTER_FAILURE.as_secs() / 3600
+            ),
             Outcome::Healed {
                 probe,
                 repaired,
-                swept,
+                sweep,
                 elapsed,
             } => {
-                let swept = match swept {
-                    Some((files, bytes)) => format!(
+                let swept = match sweep {
+                    Sweep::Swept { files, bytes } => format!(
                         "swept {files} blob files ({})",
                         crate::report::format_bytes(*bytes)
                     ),
-                    None => "the blob sweep failed and is left to the next GC".to_string(),
+                    Sweep::Failed => "the blob sweep failed and is left to the next GC".to_string(),
+                    Sweep::LeftToGc => "unowned blob files are left to this GC's sweep".to_string(),
                 };
                 format!(
                     "blob index healed in {} ms: {} blobs ({}) had no owner, {} refcounts were off; \
@@ -210,7 +290,9 @@ impl Outcome {
     fn is_noteworthy(&self) -> bool {
         matches!(
             self,
-            Outcome::Healed { .. } | Outcome::Skipped(SkipReason::TooManyEntries)
+            Outcome::Healed { .. }
+                | Outcome::OutOfTime { .. }
+                | Outcome::Skipped(SkipReason::TooManyEntries)
         )
     }
 }
@@ -262,22 +344,83 @@ fn attempt(config: &Config, trigger: Trigger<'_>, now: u64) -> anyhow::Result<Ou
         }
     };
     clear_state(cache_dir);
-    let swept = store
-        .sweep_orphan_blobs(crate::daemon::ORPHAN_BLOB_GRACE)
-        .map(|stats| (stats.removed, stats.bytes_reclaimed))
-        .ok();
+    let sweep = match store.sweep_orphan_blobs(crate::daemon::ORPHAN_BLOB_GRACE) {
+        Ok(stats) => Sweep::Swept {
+            files: stats.removed,
+            bytes: stats.bytes_reclaimed,
+        },
+        Err(_) => Sweep::Failed,
+    };
     Ok(Outcome::Healed {
         probe,
         repaired,
-        swept,
+        sweep,
         elapsed: started.elapsed(),
     })
 }
 
-/// One repair attempt. Blocking: call from `spawn_blocking`. Errors are
-/// logged and dropped; a later check retries.
-pub(crate) fn run(config: &Config, trigger: Trigger<'_>) -> Option<Outcome> {
-    match attempt(config, trigger, unix_now_secs()) {
+/// The repair inside a GC sweep. The caller holds `gc.lock`, and builds may
+/// be running: the scan stops at `budget` and the repair then changes
+/// nothing. The GC's own orphan sweep follows, so this one does not sweep.
+fn attempt_in_gc(config: &Config, now: u64, budget: Duration) -> anyhow::Result<Outcome> {
+    let started = Instant::now();
+    let cache_dir = &config.cache_dir;
+    let store = Store::open(config)?;
+    let probe = store.blob_refcount_drift()?;
+    if probe.is_clean() {
+        clear_state(cache_dir);
+        clear_gc_overrun(cache_dir);
+        return Ok(Outcome::NotNeeded);
+    }
+    if is_backing_off(read_failure(cache_dir).map(|f| f.failed_at), now) {
+        return Ok(Outcome::Skipped(SkipReason::BackingOff));
+    }
+    let entries = store.entry_count()? as u64;
+    if gc_overrun_holds(read_gc_overrun(cache_dir), now, entries) {
+        return Ok(Outcome::Skipped(SkipReason::OutOfTimeRecently));
+    }
+    // Wait for a build's write to finish, but not as long as a wrapper
+    // would: the next sweep or quiet check retries.
+    store.file_hash_cache().db().pragma_update(
+        None,
+        "busy_timeout",
+        GC_LOCK_WAIT.as_millis() as i64,
+    )?;
+    let error = match store.reconcile_blob_index_by(Some(started + budget)) {
+        Ok(repaired) => {
+            clear_state(cache_dir);
+            clear_gc_overrun(cache_dir);
+            return Ok(Outcome::Healed {
+                probe,
+                repaired,
+                sweep: Sweep::LeftToGc,
+                elapsed: started.elapsed(),
+            });
+        }
+        Err(error) => error,
+    };
+    if let Some(&ReconcileOutOfTime { read, total }) = error.downcast_ref() {
+        record_gc_overrun(
+            cache_dir,
+            GcOverrun {
+                at: now,
+                read: read as u64,
+            },
+        );
+        return Ok(Outcome::OutOfTime { read, total });
+    }
+    if is_index_busy(&error) {
+        return Ok(Outcome::IndexBusy);
+    }
+    let reason = format!("{error:#}");
+    record_failure(cache_dir, now, &reason);
+    Ok(Outcome::Failed { reason })
+}
+
+/// Log an attempt's outcome, or its error, which is dropped: a later check
+/// retries.
+fn report(attempted: anyhow::Result<Outcome>) -> Option<Outcome> {
+    match attempted {
         Ok(outcome) => {
             if outcome.is_refusal() {
                 tracing::warn!("{}", outcome.describe());
@@ -293,6 +436,16 @@ pub(crate) fn run(config: &Config, trigger: Trigger<'_>) -> Option<Outcome> {
             None
         }
     }
+}
+
+/// One repair inside a daemon GC sweep that holds `gc.lock`. Blocking.
+pub(crate) fn run_in_gc(config: &Config) -> Option<Outcome> {
+    report(attempt_in_gc(config, unix_now_secs(), GC_BUDGET))
+}
+
+/// One repair attempt. Blocking: call from `spawn_blocking`.
+pub(crate) fn run(config: &Config, trigger: Trigger<'_>) -> Option<Outcome> {
+    report(attempt(config, trigger, unix_now_secs()))
 }
 
 #[cfg(test)]
@@ -315,6 +468,8 @@ mod tests {
     fn limits_are_the_documented_ones() {
         assert_eq!(RETRY_AFTER_FAILURE, Duration::from_secs(21_600));
         assert_eq!(SHUTDOWN_MAX_ENTRIES, 25_000);
+        assert_eq!(GC_BUDGET, Duration::from_secs(2));
+        assert_eq!(GC_LOCK_WAIT, Duration::from_secs(1));
         assert_eq!(crate::daemon::ORPHAN_BLOB_GRACE, Duration::from_secs(3600));
     }
 
@@ -465,11 +620,12 @@ mod tests {
             SkipReason::BackingOff,
             SkipReason::TooManyEntries,
             SkipReason::GcRunning,
+            SkipReason::OutOfTimeRecently,
         ]
         .map(SkipReason::label)
         .into_iter()
         .collect();
-        assert_eq!(labels.len(), 5);
+        assert_eq!(labels.len(), 6);
         assert!(labels.iter().all(|label| !label.is_empty()));
     }
 
@@ -478,7 +634,7 @@ mod tests {
         let healed = Outcome::Healed {
             probe: BlobRefcountDrift::default(),
             repaired: BlobIndexDrift::default(),
-            swept: None,
+            sweep: Sweep::Failed,
             elapsed: Duration::ZERO,
         };
         let failed = Outcome::Failed {
@@ -488,6 +644,10 @@ mod tests {
         assert!(healed.is_noteworthy() && !healed.is_refusal());
         let too_many = Outcome::Skipped(SkipReason::TooManyEntries);
         assert!(too_many.is_noteworthy() && !too_many.is_refusal());
+        let out_of_time = Outcome::OutOfTime { read: 1, total: 2 };
+        assert!(out_of_time.is_noteworthy() && !out_of_time.is_refusal());
+        let skipped = Outcome::Skipped(SkipReason::OutOfTimeRecently);
+        assert!(!skipped.is_noteworthy() && !skipped.is_refusal());
         for quiet in [
             Outcome::NotNeeded,
             Outcome::IndexBusy,
@@ -511,7 +671,7 @@ mod tests {
             Outcome::IndexBusy.describe(),
             "blob index heal found the index busy; will retry"
         );
-        let healed = |swept| Outcome::Healed {
+        let healed = |sweep| Outcome::Healed {
             probe: BlobRefcountDrift {
                 unowned: 1_430,
                 unowned_bytes: 27 << 30,
@@ -524,11 +684,15 @@ mod tests {
                 entry_mappings: 3,
                 blobs: 2_004,
             },
-            swept,
+            sweep,
             elapsed: Duration::from_millis(1500),
         };
         assert_eq!(
-            healed(Some((1_430, 1 << 20))).describe(),
+            healed(Sweep::Swept {
+                files: 1_430,
+                bytes: 1 << 20
+            })
+            .describe(),
             format!(
                 "blob index healed in 1500 ms: 1430 blobs ({}) had no owner, 574 refcounts were off; \
                  rewrote 2004 blob rows and 3 mappings; swept 1430 blob files ({})",
@@ -537,9 +701,28 @@ mod tests {
             )
         );
         assert!(
-            healed(None)
+            healed(Sweep::Failed)
                 .describe()
                 .ends_with("3 mappings; the blob sweep failed and is left to the next GC")
+        );
+        assert!(
+            healed(Sweep::LeftToGc)
+                .describe()
+                .ends_with("3 mappings; unowned blob files are left to this GC's sweep")
+        );
+        assert_eq!(
+            Outcome::OutOfTime {
+                read: 65_000,
+                total: 90_000
+            }
+            .describe(),
+            "blob index heal in GC stopped after 2 s, having read 65000 of 90000 entries, \
+             and changed nothing; GC skips it for 6 h unless the store shrinks to 65000 \
+             entries, and it runs unbounded once builds are idle"
+        );
+        assert_eq!(
+            Outcome::Skipped(SkipReason::OutOfTimeRecently).describe(),
+            "blob index heal deferred: the last heal in GC ran out of time on a store this size"
         );
         assert_eq!(
             Outcome::Failed {
@@ -700,7 +883,7 @@ mod tests {
         let Outcome::Healed {
             probe: seen,
             repaired,
-            swept,
+            sweep,
             ..
         } = attempt(&drifted.config, Trigger::Periodic(&clock), NOW).unwrap()
         else {
@@ -714,7 +897,13 @@ mod tests {
                 blobs: 3
             }
         );
-        assert_eq!(swept, Some((1, STALE.len() as u64)));
+        assert_eq!(
+            sweep,
+            Sweep::Swept {
+                files: 1,
+                bytes: STALE.len() as u64
+            }
+        );
         assert_eq!(refcount(&drifted.config, &drifted.shared), 2);
         assert_eq!(probe(&drifted.config), BlobRefcountDrift::default());
         assert!(!drifted.stale.exists());
@@ -728,6 +917,176 @@ mod tests {
             run(&drifted.config, Trigger::Periodic(&clock)),
             Some(Outcome::NotNeeded)
         );
+    }
+
+    /// #1206: a host that is never quiet still gets the repair from its GC.
+    #[test]
+    #[cfg(unix)]
+    fn gc_heals_while_builds_run_and_leaves_the_sweep_to_the_gc() {
+        let dir = tempfile::tempdir().unwrap();
+        let drifted = drifted_store(dir.path());
+        let permit = hold_permit(&drifted.config);
+        let Outcome::Healed {
+            probe: seen,
+            repaired,
+            sweep,
+            ..
+        } = attempt_in_gc(&drifted.config, NOW, GC_BUDGET).unwrap()
+        else {
+            panic!("a GC sweep must heal despite running builds");
+        };
+        assert_eq!(seen, DRIFT);
+        assert_eq!(
+            repaired,
+            BlobIndexDrift {
+                entry_mappings: 0,
+                blobs: 3
+            }
+        );
+        assert_eq!(sweep, Sweep::LeftToGc);
+        assert_eq!(refcount(&drifted.config, &drifted.shared), 2);
+        assert_eq!(probe(&drifted.config), BlobRefcountDrift::default());
+        assert!(drifted.stale.exists(), "the GC's own sweep unlinks it");
+        assert_eq!(
+            attempt_in_gc(&drifted.config, NOW, GC_BUDGET).unwrap(),
+            Outcome::NotNeeded
+        );
+        drop(permit);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn gc_heal_past_its_budget_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let drifted = drifted_store(dir.path());
+        let cache_dir = &drifted.config.cache_dir;
+        assert_eq!(
+            attempt_in_gc(&drifted.config, NOW, Duration::ZERO).unwrap(),
+            Outcome::OutOfTime { read: 0, total: 2 }
+        );
+        assert_untouched(&drifted);
+        assert!(
+            !state_path(cache_dir).exists(),
+            "running out of time is not a failure"
+        );
+        assert_eq!(
+            read_gc_overrun(cache_dir),
+            Some(GcOverrun { at: NOW, read: 0 })
+        );
+
+        // The next sweeps skip it, and take no lock for it.
+        for now in [NOW, NOW + 21_599] {
+            assert_eq!(
+                attempt_in_gc(&drifted.config, now, GC_BUDGET).unwrap(),
+                Outcome::Skipped(SkipReason::OutOfTimeRecently)
+            );
+        }
+        assert_untouched(&drifted);
+
+        // After the window it tries again, and a heal clears the record.
+        assert!(matches!(
+            attempt_in_gc(&drifted.config, NOW + 21_600, GC_BUDGET).unwrap(),
+            Outcome::Healed { .. }
+        ));
+        assert_eq!(read_gc_overrun(cache_dir), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn gc_heal_retries_once_the_store_fits_what_it_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let drifted = drifted_store(dir.path());
+        let cache_dir = &drifted.config.cache_dir;
+        // The overrun read one of the two entries in time.
+        record_gc_overrun(cache_dir, GcOverrun { at: NOW, read: 1 });
+        assert_eq!(
+            attempt_in_gc(&drifted.config, NOW, GC_BUDGET).unwrap(),
+            Outcome::Skipped(SkipReason::OutOfTimeRecently)
+        );
+        Store::open(&drifted.config)
+            .unwrap()
+            .remove_entry("heal_b")
+            .unwrap();
+        assert!(matches!(
+            attempt_in_gc(&drifted.config, NOW, GC_BUDGET).unwrap(),
+            Outcome::Healed { .. }
+        ));
+        assert_eq!(read_gc_overrun(cache_dir), None);
+    }
+
+    #[test]
+    fn an_overrun_holds_for_six_hours_while_the_store_is_as_large() {
+        let overrun = Some(GcOverrun { at: NOW, read: 100 });
+        assert!(gc_overrun_holds(overrun, NOW, 101));
+        assert!(gc_overrun_holds(overrun, NOW + 21_599, 101));
+        assert!(!gc_overrun_holds(overrun, NOW + 21_600, 101), "expired");
+        assert!(!gc_overrun_holds(overrun, NOW, 100), "fits what it read");
+        assert!(!gc_overrun_holds(overrun, NOW - 1, 101), "from the future");
+        assert!(!gc_overrun_holds(None, NOW, 101));
+    }
+
+    #[test]
+    fn a_clean_store_clears_an_overrun() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().to_path_buf());
+        drop(Store::open(&config).unwrap());
+        record_gc_overrun(dir.path(), GcOverrun { at: NOW, read: 0 });
+        assert_eq!(run_in_gc(&config), Some(Outcome::NotNeeded));
+        assert_eq!(read_gc_overrun(dir.path()), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn gc_heal_waits_out_a_failure_and_records_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let drifted = drifted_store(dir.path());
+        let cache_dir = &drifted.config.cache_dir;
+        record_failure(cache_dir, NOW, "an earlier refusal");
+        assert_eq!(
+            attempt_in_gc(&drifted.config, NOW + 21_599, GC_BUDGET).unwrap(),
+            Outcome::Skipped(SkipReason::BackingOff)
+        );
+        assert_untouched(&drifted);
+
+        let meta = Store::open(&drifted.config)
+            .unwrap()
+            .entry_dir("heal_b")
+            .join("meta.json");
+        std::fs::write(&meta, b"{truncated").unwrap();
+        assert!(matches!(
+            attempt_in_gc(&drifted.config, NOW + 21_600, GC_BUDGET).unwrap(),
+            Outcome::Failed { .. }
+        ));
+        assert_eq!(read_failure(cache_dir).unwrap().failed_at, NOW + 21_600);
+        assert_untouched(&drifted);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn gc_heal_yields_to_a_held_index_without_backing_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let drifted = drifted_store(dir.path());
+        let writer = rusqlite::Connection::open(drifted.config.index_db_path()).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            attempt_in_gc(&drifted.config, NOW, GC_BUDGET).unwrap(),
+            Outcome::IndexBusy
+        );
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(!state_path(&drifted.config.cache_dir).exists());
+        writer.execute_batch("ROLLBACK").unwrap();
+        assert_untouched(&drifted);
+    }
+
+    #[test]
+    fn gc_heal_leaves_a_clean_store_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().to_path_buf());
+        drop(Store::open(&config).unwrap());
+        record_failure(dir.path(), NOW, "old");
+        assert_eq!(run_in_gc(&config), Some(Outcome::NotNeeded));
+        assert!(!state_path(dir.path()).exists());
     }
 
     #[test]

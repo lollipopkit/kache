@@ -121,6 +121,8 @@ A nested build finds its test's slots through `KACHE_TEST_LEASE`. A build that r
 
 By default, GC keeps an entry when removing its last store name would reclaim zero bytes. This preserves a usable cache hit. It also means the registered store size can remain above `local_max_size` until the target output is removed. `kache gc` reports these entries as unreclaimable and separates store bytes removed from disk bytes reclaimed.
 
+A size sweep measures these bytes before it evicts anything: every blob a build output still links or clones, shared or not, and the other blobs of the entries kept for them. It leaves them out of its trigger and target, so it evicts only until the rest of the store fits. The automatic trigger leaves the same bytes out for 6 hours, so a store that is over budget only because of them does not start sweeps that cannot free anything. After 6 hours, or as soon as anything other than the size sweep removes blobs (another GC pass, `kache purge`, a blob index heal), the next automatic sweep measures again. The measurement lives in `gc-unreclaimable.json` in the cache dir.
+
 Automatic eviction has one trigger. A sweep starts when the store is above 110% of `local_max_size` and evicts down to 90%. Three things can ask for one: a build that has just stored an entry (checked at most every 5 minutes), the daemon after an upload, and the daemon's 6-hour sweep. All three use the same trigger. `kache gc` still evicts from 100%.
 
 While a daemon is running, it does the sweeping. A build that finds the store over the trigger sends the daemon a hint and continues; it does not wait for the sweep, and it never starts a daemon for this. Hints that arrive during a sweep are dropped. With no daemon, or a daemon too old to know the hint, the build starts a detached `kache gc` as before. That worker sweeps a second time two minutes later only if the first sweep had to skip entries a running build was using.
@@ -149,9 +151,9 @@ The equivalent environment setting is `KACHE_GC_EVICT_SHARED=1`. With this optio
 
 ### Daemon index maintenance
 
-The daemon looks after `index.db` on its own. It checks 60 seconds after it starts, every 5 minutes after that, and once at shutdown. Each check runs two steps in order: it heals the blob index, then compacts the file. Both steps hold the index write lock while they work, so both wait for a quiet machine: no compile, and no test binary run through the [test runner](#test-runner), holds a scheduler slot, and the daemon has received no build request for 60 seconds. Stats polling and an open `kache monitor` do not count as build requests. Neither step overlaps a GC sweep.
+The daemon looks after `index.db` on its own. It checks 60 seconds after it starts, every 5 minutes after that, and once at shutdown. Each check runs three steps in order: it heals the blob index, rebuilds the file hash table of an older store, then compacts the file. All three hold the index write lock while they work, so all wait for a quiet machine: no compile, and no test binary run through the [test runner](#test-runner), holds a scheduler slot, and the daemon has received no build request for 60 seconds. Stats polling and an open `kache monitor` do not count as build requests. No step overlaps a GC sweep.
 
-Set `cache.index_auto_compact = false` or `KACHE_INDEX_AUTO_COMPACT=0` to turn both steps off. `kache doctor --repair` does the same work on demand either way.
+Set `cache.index_auto_compact = false` or `KACHE_INDEX_AUTO_COMPACT=0` to turn all three steps off, and the heal in GC sweeps with them. `kache doctor --repair` does the same work on demand either way.
 
 #### Blob index heal
 
@@ -159,9 +161,17 @@ The index keeps two tables about blobs: one row per blob with its size and a ref
 
 Every check compares the two tables with one read-only query. When they disagree and the machine is quiet, the daemon rebuilds both tables from the `meta.json` of every committed entry, in one transaction. Blob files that no row references after that are deleted once they are an hour old, the same grace GC uses, so a store in the middle of a write is not disturbed. The compaction step that follows returns the freed pages to the disk.
 
-The heal has no fallback for a machine that is never quiet. It reads every entry's metadata under the write lock, so its duration grows with the store, and drift costs disk space, never a wrong cache hit. At shutdown it runs only when the store has at most 25,000 entries. If another process is using the index when it starts, it stops at once and a later check retries.
+The heal reads every entry's metadata under the write lock, so its duration grows with the store. Drift costs disk space, never a wrong cache hit. At shutdown it runs only when the store has at most 25,000 entries. If another process is using the index when it starts, it stops at once and a later check retries.
+
+A machine that is never quiet gets the heal from the daemon's GC sweeps instead. Each sweep runs it before evicting, whether or not builds are running, and stops reading metadata after 2 seconds. A heal that stops there changes nothing; a larger store is healed once the machine is quiet. GC sweeps then skip the heal for 6 hours, unless the store shrinks to the number of entries the stopped heal read in time, so a store too large for the budget does not hold the write lock for 2 seconds at every sweep. The record lives in `blob-heal-gc.json` in the cache dir and is cleared once the index is healed. A write that queues behind the heal waits at most those 2 seconds, inside the wrappers' normal index timeout. Unowned blob files are then left to the sweep's own orphan pass.
 
 The rebuild refuses to run if it cannot trust an entry: a `meta.json` that is missing or does not parse, or a blob that is missing or has the wrong size. It then changes nothing, logs one warning that names the entry, and waits 6 hours before it tries again. The wait is kept across daemon restarts, in `blob-heal.json` in the cache dir. To fix it, run `kache doctor --repair` when no build is running: it removes the corrupt entry and rebuilds the blob index.
+
+#### File hash table rebuild
+
+Kache records the content hash of each large input file it reads, keyed by path, so an unchanged file is not hashed again. GC deletes hashes recorded more than 30 days ago, at most 100,000 per sweep, 500 per index write, so builds never wait long on the delete. A lookup does not refresh a hash, so a file read all month without changing is hashed again once.
+
+Stores created by older versions of kache keep this table in a layout that stores every path twice. On a quiet machine the daemon rewrites the table once, in one transaction, and the compaction step that follows returns the freed pages to the disk. It waits until GC has deleted every expired hash, and it leaves a table of more than 1,000,000 hashes to `kache doctor --repair`, because the rewrite holds the index for its whole length. If another process is using the index when it starts, it stops at once and a later check retries.
 
 #### Index compaction
 
@@ -384,7 +394,7 @@ That writes `metrics.otlp.json` and `schema_version` in the directory. `--scenar
 
 On a host where several jobs share one cache, the payload reports `kache.cache.store.physical_size`: registered blob bytes, the figure GC compares with `kache.cache.store.max`. `kache.cache.store.size` is the sum of logical entry sizes and may differ. `kache.cache.store.unowned.size` is the part of the physical size held by blobs no entry maps to, which GC cannot free, and `kache.cache.store.refcount_drift` counts the blobs whose reference count disagrees with the entries mapped to them, unowned ones included. Both are zero on a healthy store and return to zero after a [blob index heal](#blob-index-heal). It also reports `kache.cache.index.size` (`index.db` plus `-wal`), `kache.cache.index.wal.size`, `kache.cache.index.free.size` (the space `index.db` holds in free pages, which compaction returns to the disk), and `kache.cache.index.rowid_high_water` per table. Last-run GC gauges include duration, pinned and unreclaimable entries, failed evictions, stale WAL snapshot failures, and recently accessed entries skipped before reading their metadata. The shipper adds host identity. The index probe is read-only with a 25 ms lock timeout and omits unavailable figures. `kache stats --json` carries the index figures and GC summary as `index_bytes`, `index_wal_bytes`, `index_rowid_high_water` and `gc`.
 
-`rowid_high_water` reports the largest rowid in each table. Tables written with `INSERT OR REPLACE` (`file_hashes`, `input_predictions`, `eviction_tombstones`) allocate new rowids on replacement, so this value can grow without adding rows. C/C++ memos keep their IDs on update; their high-water value does not count refreshes. Use `kache.cache.index.size` to measure index bytes.
+`rowid_high_water` reports the largest rowid in each table. Tables written with `INSERT OR REPLACE` (`input_predictions`, `eviction_tombstones`) allocate new rowids on replacement, so this value can grow without adding rows. `file_hashes` reports it only until the [file hash table rebuild](#file-hash-table-rebuild): the rebuilt table has no rowids. C/C++ memos keep their IDs on update; their high-water value does not count refreshes. Use `kache.cache.index.size` to measure index bytes.
 
 To keep per-build numbers at machine level, add `--record` to `kache report`:
 

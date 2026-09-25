@@ -12,12 +12,14 @@ mod index_compaction;
 pub mod link;
 pub mod markers;
 pub mod opcounts;
+mod pressure;
 pub mod sharing;
 mod store;
 #[cfg(test)]
 mod test_support;
 
 pub use blob_drift::{BlobRefcountDrift, blob_refcount_drift};
+pub use pressure::UNRECLAIMABLE_RECORD_TTL;
 pub use store::*;
 
 /// Compiler-owned rules applied when publishing an entry. Implementations must

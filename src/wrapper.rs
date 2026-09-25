@@ -477,8 +477,9 @@ fn auto_gc_wanted(config: &Config, store: &Store) -> bool {
 
     // Physical on-disk bytes, not the logical per-entry sum: the logical
     // figure over-reports by the dedup savings and would spawn GC while the
-    // disk is comfortable (#608).
-    let total = match store.physical_size() {
+    // disk is comfortable (#608). Less what the last sweep found still cloned
+    // into target directories, which no sweep can free (#1206).
+    let total = match store.size_pressure() {
         Ok(total) => total,
         Err(e) => {
             tracing::debug!("auto-gc: store size query failed: {e:#}");
@@ -8283,6 +8284,28 @@ mod tests {
             .unwrap();
     }
 
+    /// Store an entry accessed just now, as a running build does: eviction
+    /// must leave it, so a sweep cannot bring the store under budget.
+    fn put_pinned_entry(store: &Store, dir: &std::path::Path, key: &str) {
+        let src = dir.join(format!("{key}.o"));
+        std::fs::write(&src, &key.as_bytes().repeat(4096)[..4096]).unwrap();
+        store
+            .put(
+                key,
+                "test-crate",
+                &[],
+                &[],
+                "host",
+                "dev",
+                &[(src.clone(), format!("{key}.o"))],
+                "",
+                "",
+            )
+            .unwrap();
+        // A source left behind can share the blob's blocks and retain it.
+        std::fs::remove_file(&src).unwrap();
+    }
+
     /// Store an idle entry whose blob a target directory still hardlinks:
     /// eviction reaches it and cannot free it.
     fn put_retained_entry(store: &Store, dir: &std::path::Path, key: &str) {
@@ -8313,9 +8336,10 @@ mod tests {
     /// The production thrash: a store over budget whose bytes target
     /// directories still hold. Every sweep freed nothing and the next check,
     /// five minutes later, spawned another one, around the clock, contending
-    /// with builds for the index each time.
+    /// with builds for the index each time. The first sweep now measures
+    /// those bytes and leaves them out, so there is no pressure to retry.
     #[test]
-    fn auto_gc_backs_off_while_a_sweep_leaves_the_store_over_budget() {
+    fn auto_gc_does_not_sweep_again_for_bytes_target_directories_hold() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = test_config(dir.path().to_path_buf());
         cfg.max_size = 1024;
@@ -8325,6 +8349,25 @@ mod tests {
 
         crate::cli::run_auto_gc_worker(&cfg, std::time::Duration::ZERO);
         assert!(store.contains("retained-1") && store.contains("retained-2"));
+        assert_eq!(read_auto_gc_backoff(&cfg.cache_dir), None);
+        expire_auto_gc_stamp(&cfg);
+        assert!(!auto_gc_wanted(&cfg, &store));
+    }
+
+    /// A store no sweep can bring under budget for now, because builds are
+    /// using its entries: the automatic sweeps back off instead of running
+    /// at every check.
+    #[test]
+    fn auto_gc_backs_off_while_a_sweep_leaves_the_store_over_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path().to_path_buf());
+        cfg.max_size = 1024;
+        let store = Store::open(&cfg).unwrap();
+        put_pinned_entry(&store, dir.path(), "pinned-1");
+        put_pinned_entry(&store, dir.path(), "pinned-2");
+
+        crate::cli::run_auto_gc_worker(&cfg, std::time::Duration::ZERO);
+        assert!(store.contains("pinned-1") && store.contains("pinned-2"));
         let backoff = read_auto_gc_backoff(&cfg.cache_dir).expect("backoff recorded");
         assert_eq!(backoff.interval_secs, 600);
         assert_eq!(backoff.size_after, 8192);
@@ -8359,7 +8402,7 @@ mod tests {
         let mut cfg = test_config(dir.path().to_path_buf());
         cfg.max_size = 1024;
         let store = Store::open(&cfg).unwrap();
-        put_retained_entry(&store, dir.path(), "retained");
+        put_pinned_entry(&store, dir.path(), "pinned");
 
         let gc_lock = store.try_gc_lock().unwrap().expect("gc lock");
         crate::cli::run_auto_gc_worker(&cfg, std::time::Duration::ZERO);
@@ -8469,6 +8512,29 @@ mod tests {
         assert_eq!(store.physical_size().unwrap(), 1101);
         expire_auto_gc_stamp(&cfg);
         assert!(auto_gc_wanted(&cfg, &store));
+    }
+
+    /// #1206: a store over the trigger only by bytes still linked into a
+    /// target directory asks for no sweep once a sweep has measured them.
+    #[test]
+    fn auto_gc_wanted_leaves_out_bytes_the_last_sweep_could_not_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path().to_path_buf());
+        cfg.max_size = 1000;
+        let store = Store::open(&cfg).unwrap();
+        put_sized_entry(&store, dir.path(), "linked", 1500);
+        let meta = store.get("linked").unwrap().unwrap();
+        std::fs::hard_link(
+            store.blob_path(&meta.files[0].hash),
+            dir.path().join("target-copy.o"),
+        )
+        .unwrap();
+        assert!(auto_gc_wanted(&cfg, &store), "nothing measured yet");
+
+        let stats = store.evict().unwrap();
+        assert_eq!(stats.unreclaimable_bytes, 1500, "{stats:?}");
+        expire_auto_gc_stamp(&cfg);
+        assert!(!auto_gc_wanted(&cfg, &store));
     }
 
     #[test]
@@ -8604,7 +8670,7 @@ mod tests {
         pinned_cfg.record_sessions = true;
         let pinned_store = Store::open(&pinned_cfg).unwrap();
         // Just stored: inside the idle grace, so eviction pins it.
-        put_test_entry(&pinned_store, pinned_dir.path(), "pinned");
+        put_pinned_entry(&pinned_store, pinned_dir.path(), "pinned");
         crate::cli::run_auto_gc_worker(&pinned_cfg, std::time::Duration::ZERO);
         assert_eq!(recorded_gc_runs(&pinned_cfg), 2);
         assert_eq!(
