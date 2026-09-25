@@ -512,6 +512,54 @@ pub(crate) fn manages_instance(config: &crate::config::Config) -> Result<bool> {
     )
 }
 
+/// Where a daemon started for this instance writes the error that stops it
+/// from starting (kunobi-ninja/kache#1218). The tracing log is opened only
+/// once the daemon is up, so it never holds that error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StartupLog {
+    File(PathBuf),
+    /// The systemd journal of the user unit.
+    Journal,
+    /// The Task Scheduler task runs headless and keeps no stderr.
+    Discarded,
+}
+
+impl std::fmt::Display for StartupLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File(path) => write!(f, "{}", path.display()),
+            Self::Journal => write!(f, "journalctl --user -u {UNIT_NAME}"),
+            Self::Discarded => write!(
+                f,
+                "not kept by the scheduled task; run `kache daemon run` to see it"
+            ),
+        }
+    }
+}
+
+pub(crate) fn startup_log(config: &crate::config::Config) -> StartupLog {
+    startup_log_for(
+        manages_instance(config).unwrap_or(false),
+        config.socket_path().with_extension("log"),
+    )
+}
+
+/// The installed service starts a daemon it manages, with its own stderr;
+/// anything else starts it through `daemon start` or auto-start, which send
+/// stderr to `runtime_log`.
+fn startup_log_for(managed: bool, runtime_log: PathBuf) -> StartupLog {
+    if !managed {
+        return StartupLog::File(runtime_log);
+    }
+    if cfg!(target_os = "macos") {
+        StartupLog::File(log_dir().join("err.log"))
+    } else if cfg!(windows) {
+        StartupLog::Discarded
+    } else {
+        StartupLog::Journal
+    }
+}
+
 fn configured_instance_matches(
     requested_socket: &Path,
     mut store: PathBuf,
@@ -554,16 +602,27 @@ pub fn kickstart(deadline: std::time::Instant) -> Result<bool> {
         }
         let uid = crate::platform::current_uid();
         let target = format!("gui/{uid}/{LABEL}");
-        let out = command_output_until(
-            std::process::Command::new("launchctl").args(["kickstart", &target]),
-            deadline,
+        let domain = format!("gui/{uid}");
+        start_launchd_job(
+            &target,
+            || {
+                command_output_until(
+                    std::process::Command::new("launchctl").args(["kickstart", &target]),
+                    deadline,
+                )
+                .context("running launchctl kickstart")
+            },
+            || {
+                command_output_until(
+                    std::process::Command::new("launchctl")
+                        .arg("bootstrap")
+                        .arg(&domain)
+                        .arg(&plist),
+                    deadline,
+                )
+                .context("running launchctl bootstrap")
+            },
         )
-        .context("running launchctl kickstart")?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            anyhow::bail!("launchctl kickstart {target} failed: {stderr}");
-        }
-        Ok(true)
     }
     #[cfg(target_os = "linux")]
     {
@@ -601,6 +660,43 @@ pub fn kickstart(deadline: std::time::Instant) -> Result<bool> {
         let _ = deadline;
         Ok(false)
     }
+}
+
+/// `launchctl kickstart` exits with this when launchd has no job by that
+/// label: "Could not find service".
+#[cfg(any(target_os = "macos", all(test, unix)))]
+const LAUNCHCTL_NO_SUCH_SERVICE: i32 = 113;
+
+/// Start the installed launchd job, loading it first when launchd does not
+/// have it (kunobi-ninja/kache#720).
+///
+/// A plist in `~/Library/LaunchAgents` is loaded at login, but a job booted
+/// out since then (`launchctl bootout`, an interrupted reinstall) stays
+/// unknown to launchd until the next login, and `kickstart` refuses it.
+/// Bootstrapping the plist loads it, and `RunAtLoad` starts it.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn start_launchd_job(
+    target: &str,
+    kickstart: impl FnOnce() -> Result<std::process::Output>,
+    bootstrap: impl FnOnce() -> Result<std::process::Output>,
+) -> Result<bool> {
+    let started = kickstart()?;
+    if started.status.success() {
+        return Ok(true);
+    }
+    if started.status.code() != Some(LAUNCHCTL_NO_SUCH_SERVICE) {
+        anyhow::bail!(
+            "launchctl kickstart {target} failed: {}",
+            String::from_utf8_lossy(&started.stderr).trim()
+        );
+    }
+    let loaded = bootstrap()?;
+    anyhow::ensure!(
+        loaded.status.success(),
+        "{target} is installed but not loaded, and launchctl bootstrap failed: {}",
+        String::from_utf8_lossy(&loaded.stderr).trim()
+    );
+    Ok(true)
 }
 
 /// Interpret Task Scheduler results independently of the Windows command adapter.
@@ -830,6 +926,7 @@ pub fn status(json: bool) -> Result<()> {
             daemon_version: Option<String>,
             daemon_epoch: Option<u64>,
             daemon_config_path: Option<String>,
+            startup_log: Option<String>,
             service_executable_mismatch: bool,
         }
         return crate::machine::emit(
@@ -851,6 +948,7 @@ pub fn status(json: bool) -> Result<()> {
                     .as_ref()
                     .and_then(|stats| stats.effective_config.as_ref())
                     .map(|config| config.config_path.clone()),
+                startup_log: config.as_ref().map(|cfg| startup_log(cfg).to_string()),
                 service_executable_mismatch: exe_mismatch.is_some(),
             },
             if running {
@@ -883,6 +981,12 @@ pub fn status(json: bool) -> Result<()> {
         println!("  Logs:     {}", log_dir().join("err.log").display());
     } else if cfg!(target_os = "linux") {
         println!("  Logs:     journalctl --user -u {UNIT_NAME}");
+    }
+    if let Some(ref cfg) = config {
+        println!(
+            "  Startup:  {} (why a daemon failed to start)",
+            startup_log(cfg)
+        );
     }
 
     // 5. Daemon version check
@@ -1104,6 +1208,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_startup_failure_is_looked_for_where_the_starter_sent_stderr() {
+        let runtime_log = PathBuf::from("/run/kache/daemon.log");
+        assert_eq!(
+            startup_log_for(false, runtime_log.clone()),
+            StartupLog::File(runtime_log.clone())
+        );
+        let managed = startup_log_for(true, runtime_log.clone());
+        if cfg!(target_os = "macos") {
+            assert_eq!(managed, StartupLog::File(log_dir().join("err.log")));
+        } else if cfg!(windows) {
+            assert_eq!(managed, StartupLog::Discarded);
+        } else {
+            assert_eq!(managed, StartupLog::Journal);
+        }
+        assert_eq!(
+            StartupLog::File(runtime_log.clone()).to_string(),
+            runtime_log.display().to_string()
+        );
+        assert_eq!(
+            StartupLog::Journal.to_string(),
+            "journalctl --user -u kache.service"
+        );
+        assert!(
+            StartupLog::Discarded
+                .to_string()
+                .contains("kache daemon run")
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn task_scheduler_start_distinguishes_absent_started_and_failed() {
@@ -1122,6 +1256,71 @@ mod tests {
         assert!(
             start_scheduled_task(output(true), || Err(anyhow::anyhow!("manager unavailable")))
                 .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_launchd_job_that_is_not_loaded_is_bootstrapped_instead() {
+        use std::os::unix::process::ExitStatusExt;
+        let output = |code: i32, stderr: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        // What launchctl returned for an unknown label on macOS 26.
+        assert_eq!(LAUNCHCTL_NO_SUCH_SERVICE, 113);
+        let target = "gui/501/ninja.kunobi.kache";
+
+        // A loaded job starts through kickstart alone.
+        assert!(
+            start_launchd_job(
+                target,
+                || Ok(output(0, "")),
+                || panic!("a loaded job is not bootstrapped")
+            )
+            .unwrap()
+        );
+
+        // An unknown job is loaded, which starts it.
+        let bootstrapped = std::cell::Cell::new(false);
+        assert!(
+            start_launchd_job(
+                target,
+                || Ok(output(LAUNCHCTL_NO_SUCH_SERVICE, "Could not find service")),
+                || {
+                    bootstrapped.set(true);
+                    Ok(output(0, ""))
+                }
+            )
+            .unwrap()
+        );
+        assert!(bootstrapped.get());
+
+        // Any other kickstart failure is reported as is.
+        let error = start_launchd_job(
+            target,
+            || Ok(output(LAUNCHCTL_NO_SUCH_SERVICE - 1, "refused")),
+            || panic!("only a missing job is bootstrapped"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("kickstart") && error.contains("refused"),
+            "{error}"
+        );
+
+        // A bootstrap that fails says both what was wrong and what failed.
+        let error = start_launchd_job(
+            target,
+            || Ok(output(LAUNCHCTL_NO_SUCH_SERVICE, "")),
+            || Ok(output(5, "Input/output error")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("not loaded") && error.contains("Input/output error"),
+            "{error}"
         );
     }
 

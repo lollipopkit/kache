@@ -4601,6 +4601,7 @@ fn daemon_version_check(
     starting_epoch: Option<u64>,
     my_version: &str,
     my_epoch: u64,
+    startup_log: &str,
 ) -> (bool, String, Option<String>) {
     match (daemon, starting_epoch) {
         (Some((version, epoch)), _) if epoch > 0 && version == my_version && epoch == my_epoch => {
@@ -4678,7 +4679,10 @@ fn daemon_version_check(
         (None, None) => (
             false,
             "daemon not reachable".into(),
-            Some("start daemon with `kache daemon start` or `kache daemon install`".into()),
+            Some(format!(
+                "start daemon with `kache daemon start` or `kache daemon install`; \
+                 if it does not start, the reason is in {startup_log}"
+            )),
         ),
     }
 }
@@ -5067,6 +5071,7 @@ pub fn doctor(
             crate::daemon::starting_daemon_epoch(cfg),
             my_version,
             my_epoch,
+            &crate::service::startup_log(cfg).to_string(),
         );
         checks.push(Check {
             label: "Daemon version",
@@ -7167,7 +7172,13 @@ mod tests {
     /// the hint must point at the flag that actually restarts it.
     #[test]
     fn daemon_version_check_names_the_pending_upgrade() {
-        let (pass, detail, fix) = daemon_version_check(Some(("0.13.0", 100)), None, "0.14.0", 200);
+        let (pass, detail, fix) = daemon_version_check(
+            Some(("0.13.0", 100)),
+            None,
+            "0.14.0",
+            200,
+            "/run/kache/daemon.log",
+        );
         assert!(!pass);
         assert!(detail.contains("predates"), "{detail}");
         assert!(
@@ -7194,8 +7205,13 @@ mod tests {
                 "one build, two version strings",
             ),
         ] {
-            let (pass, detail, fix) =
-                daemon_version_check(Some(daemon), None, my_version, my_epoch);
+            let (pass, detail, fix) = daemon_version_check(
+                Some(daemon),
+                None,
+                my_version,
+                my_epoch,
+                "/run/kache/daemon.log",
+            );
             assert!(!pass, "{case}: {detail}");
             assert!(detail.contains("cannot be determined"), "{case}: {detail}");
             let fix = fix.unwrap();
@@ -7207,7 +7223,13 @@ mod tests {
 
         // Equal version strings and unreadable epochs are not evidence of the
         // same build either — that pair must not pass.
-        let (pass, detail, _) = daemon_version_check(Some(("0.14.0", 0)), None, "0.14.0", 0);
+        let (pass, detail, _) = daemon_version_check(
+            Some(("0.14.0", 0)),
+            None,
+            "0.14.0",
+            0,
+            "/run/kache/daemon.log",
+        );
         assert!(!pass, "{detail}");
     }
 
@@ -7215,7 +7237,13 @@ mod tests {
     /// advise restarting the daemon, which would downgrade it.
     #[test]
     fn daemon_version_check_blames_the_binary_when_the_daemon_is_newer() {
-        let (pass, detail, fix) = daemon_version_check(Some(("0.14.0", 200)), None, "0.13.0", 100);
+        let (pass, detail, fix) = daemon_version_check(
+            Some(("0.14.0", 200)),
+            None,
+            "0.13.0",
+            100,
+            "/run/kache/daemon.log",
+        );
         assert!(!pass);
         assert!(detail.contains("newer than binary"), "{detail}");
         let fix = fix.unwrap();
@@ -7226,7 +7254,13 @@ mod tests {
     /// Matching build: the only passing state, and it stays terse.
     #[test]
     fn daemon_version_check_passes_on_identical_build() {
-        let (pass, detail, fix) = daemon_version_check(Some(("0.14.0", 200)), None, "0.14.0", 200);
+        let (pass, detail, fix) = daemon_version_check(
+            Some(("0.14.0", 200)),
+            None,
+            "0.14.0",
+            200,
+            "/run/kache/daemon.log",
+        );
         assert!(pass);
         assert_eq!(detail, "v0.14.0 (epoch 200)");
         assert!(fix.is_none());
@@ -7236,7 +7270,13 @@ mod tests {
     /// even though the version reads identical.
     #[test]
     fn daemon_version_check_catches_same_version_different_build() {
-        let (pass, detail, _) = daemon_version_check(Some(("0.14.0", 100)), None, "0.14.0", 200);
+        let (pass, detail, _) = daemon_version_check(
+            Some(("0.14.0", 100)),
+            None,
+            "0.14.0",
+            200,
+            "/run/kache/daemon.log",
+        );
         assert!(!pass, "{detail}");
         assert!(detail.contains("predates"), "{detail}");
     }
@@ -7248,7 +7288,8 @@ mod tests {
     /// file says the right build is coming up, which is what this check asks.
     #[test]
     fn daemon_version_check_reports_a_daemon_that_is_still_starting() {
-        let (pass, detail, fix) = daemon_version_check(None, Some(200), "0.14.0", 200);
+        let (pass, detail, fix) =
+            daemon_version_check(None, Some(200), "0.14.0", 200, "/run/kache/daemon.log");
         assert!(pass, "{detail}");
         assert!(detail.contains("starting"), "{detail}");
         assert!(fix.is_none());
@@ -7257,14 +7298,16 @@ mod tests {
 
         // A starting daemon of some other build gets named as such rather than
         // silently claimed to be this one.
-        let (pass, detail, _) = daemon_version_check(None, Some(100), "0.14.0", 200);
+        let (pass, detail, _) =
+            daemon_version_check(None, Some(100), "0.14.0", 200, "/run/kache/daemon.log");
         assert!(!pass, "{detail}");
         assert!(detail.contains("epoch 100"), "{detail}");
         assert!(detail.contains("0.14.0"), "{detail}");
 
         // An unreadable epoch on both sides is not a match, so it must not pass
         // through the equality arm.
-        let (pass, detail, _) = daemon_version_check(None, Some(0), "0.14.0", 0);
+        let (pass, detail, _) =
+            daemon_version_check(None, Some(0), "0.14.0", 0, "/run/kache/daemon.log");
         assert!(!pass, "{detail}");
     }
 
@@ -7299,18 +7342,26 @@ mod tests {
     /// Nothing answering and nothing coming up keeps the original wording.
     #[test]
     fn daemon_version_check_reports_an_absent_daemon() {
-        let (pass, detail, fix) = daemon_version_check(None, None, "0.14.0", 200);
+        let (pass, detail, fix) =
+            daemon_version_check(None, None, "0.14.0", 200, "/run/kache/daemon.log");
         assert!(!pass);
         assert_eq!(detail, "daemon not reachable");
-        assert!(fix.unwrap().contains("kache daemon start"));
+        let fix = fix.unwrap();
+        assert!(fix.contains("kache daemon start"), "{fix}");
+        assert!(fix.contains("/run/kache/daemon.log"), "{fix}");
     }
 
     /// A daemon that answered wins over the coordinator file: a leftover
     /// `Starting` record must not relabel a reachable daemon as starting.
     #[test]
     fn daemon_version_check_prefers_the_daemon_that_answered() {
-        let (pass, detail, _) =
-            daemon_version_check(Some(("0.14.0", 200)), Some(100), "0.14.0", 200);
+        let (pass, detail, _) = daemon_version_check(
+            Some(("0.14.0", 200)),
+            Some(100),
+            "0.14.0",
+            200,
+            "/run/kache/daemon.log",
+        );
         assert!(pass, "{detail}");
         assert_eq!(detail, "v0.14.0 (epoch 200)");
     }
