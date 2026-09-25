@@ -3431,6 +3431,7 @@ fn emit_gc_json(config: &Config, skipped: bool, stats: &crate::store::GcStats) -
         disk_bytes_reclaimed: u64,
         entries_pinned: usize,
         entries_unreclaimable: usize,
+        unreclaimable_bytes: u64,
     }
     let next = crate::machine::next_after_gc(
         &disk,
@@ -3449,6 +3450,7 @@ fn emit_gc_json(config: &Config, skipped: bool, stats: &crate::store::GcStats) -
             disk_bytes_reclaimed: stats.disk_bytes_reclaimed,
             entries_pinned: stats.entries_pinned,
             entries_unreclaimable: stats.entries_unreclaimable,
+            unreclaimable_bytes: stats.unreclaimable_bytes,
         },
         next,
     )

@@ -32,6 +32,10 @@ pub struct GcStatsPersisted {
     pub entries_pinned: usize,
     #[serde(default)]
     pub entries_unreclaimable: usize,
+    /// Bytes still cloned or hardlinked into target directories, which the
+    /// size sweep left out of size pressure (#1206).
+    #[serde(default)]
+    pub unreclaimable_bytes: u64,
     #[serde(default)]
     pub entries_failed: usize,
     #[serde(default)]
@@ -111,6 +115,9 @@ pub struct GcRunRecord {
     pub entries_import_pinned: usize,
     pub entries_pinned: usize,
     pub entries_unreclaimable: usize,
+    /// As in `gc_stats.json`.
+    #[serde(default)]
+    pub unreclaimable_bytes: u64,
     pub duration_ms: u64,
     /// Time spent in eviction writes, busy waits included.
     #[serde(default)]
@@ -143,6 +150,7 @@ impl GcRunRecord {
             entries_import_pinned: stats.entries_import_pinned,
             entries_pinned: stats.entries_pinned,
             entries_unreclaimable: stats.entries_unreclaimable,
+            unreclaimable_bytes: stats.unreclaimable_bytes,
             duration_ms: stats.duration_ms,
             evict_write_ms: stats.evict_write_ms,
             key_locks_removed: stats.housekeeping.map(|h| h.key_locks_removed),
@@ -191,6 +199,7 @@ pub(crate) fn write_last_gc_run(
         source: source.to_string(),
         entries_pinned: stats.entries_pinned,
         entries_unreclaimable: stats.entries_unreclaimable,
+        unreclaimable_bytes: stats.unreclaimable_bytes,
         entries_failed: stats.entries_failed,
         entries_locked: stats.entries_locked,
         entries_busy_snapshot: stats.entries_busy_snapshot,
@@ -3988,6 +3997,7 @@ mod tests {
             duration_ms: 9,
             entries_pinned: 4,
             entries_unreclaimable: 1,
+            unreclaimable_bytes: 12,
             entries_failed: 5,
             entries_locked: 3,
             entries_busy_snapshot: 2,
@@ -4004,7 +4014,11 @@ mod tests {
         };
 
         record_gc_run(&config, "daemon", &run).unwrap();
-        assert_eq!(read_gc_stats(&config.cache_dir).unwrap().source, "daemon");
+        let last = read_gc_stats(&config.cache_dir).unwrap();
+        assert_eq!(
+            (last.source.as_str(), last.unreclaimable_bytes),
+            ("daemon", 12)
+        );
         assert!(
             !config.cache_dir.join("telemetry").exists(),
             "recording off: no telemetry dir"
@@ -4038,6 +4052,7 @@ mod tests {
                 entries_import_pinned: 7,
                 entries_pinned: 4,
                 entries_unreclaimable: 1,
+                unreclaimable_bytes: 12,
                 duration_ms: 9,
                 evict_write_ms: 11,
                 key_locks_removed: Some(6),

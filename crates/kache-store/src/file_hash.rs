@@ -298,7 +298,8 @@ impl<'db> FileHashCache<'db> {
 
 impl FileHashCache<'_> {
     /// Delete file hash rows not written for [`FILE_HASH_RETENTION_SECS`],
-    /// at most [`FILE_HASH_PRUNE_CAP`] per call. Run from the GC sweep and
+    /// reading at most [`FILE_HASH_PRUNE_CAP`] at a time and starting no new
+    /// read after [`FILE_HASH_PRUNE_BUDGET`]. Run from the GC sweep and
     /// `doctor --repair`, like [`Self::prune_input_predictions`]. A lookup
     /// never refreshes a row, so that the hit path stays read-only; the price
     /// is one re-hash a month for a file read that whole time without
@@ -310,7 +311,26 @@ impl FileHashCache<'_> {
     /// single `DELETE` of four million expired rows held the write lock for
     /// over half a minute, and builds failed on their 5 s busy timeout.
     pub fn prune_file_hashes(&self) -> rusqlite::Result<usize> {
-        self.prune_file_hashes_at(unix_now(), FILE_HASH_PRUNE_CAP)
+        let deadline = std::time::Instant::now() + FILE_HASH_PRUNE_BUDGET;
+        self.prune_file_hashes_until(unix_now(), FILE_HASH_PRUNE_CAP, deadline)
+    }
+
+    /// Prune `cap` rows at a time until a read comes back short or
+    /// `deadline` passes.
+    fn prune_file_hashes_until(
+        &self,
+        now: i64,
+        cap: usize,
+        deadline: std::time::Instant,
+    ) -> rusqlite::Result<usize> {
+        let mut removed = 0;
+        loop {
+            let batch = self.prune_file_hashes_at(now, cap)?;
+            removed += batch;
+            if batch < cap || std::time::Instant::now() >= deadline {
+                return Ok(removed);
+            }
+        }
     }
 
     fn prune_file_hashes_at(&self, now: i64, cap: usize) -> rusqlite::Result<usize> {
@@ -365,9 +385,15 @@ impl FileHashCache<'_> {
 /// checkouts deleted long ago stayed in it for good (kunobi-ninja/kache#1206).
 pub const FILE_HASH_RETENTION_SECS: i64 = 30 * 86_400;
 
-/// Most rows one prune deletes. A table that grew for months is emptied over
-/// several GC sweeps rather than held in memory at once.
+/// Most rows one read collects, so a table that grew for months is never
+/// held in memory at once.
 pub const FILE_HASH_PRUNE_CAP: usize = 100_000;
+
+/// How long one prune keeps starting reads. Each delete chunk holds the
+/// write lock for tens of milliseconds, so the budget bounds the sweep's
+/// time, not a build's wait; three million expired rows take about three
+/// GC sweeps instead of thirty.
+pub const FILE_HASH_PRUNE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Rows deleted per write transaction.
 const FILE_HASH_PRUNE_CHUNK: usize = 500;
@@ -1236,6 +1262,25 @@ mod tests {
         assert_eq!(cache.prune_file_hashes_at(now, rows - 1).unwrap(), rows - 1);
         assert_eq!(file_hash_paths(&cache).len(), 2, "one old row waits");
         assert_eq!(cache.prune_file_hashes_at(now, rows).unwrap(), 1);
+        assert_eq!(file_hash_paths(&cache), ["/fresh"]);
+    }
+
+    #[test]
+    fn prune_file_hashes_reads_again_until_short_or_out_of_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        let now = 1_900_000_000;
+        for i in 0..10 {
+            put_file_hash_recorded_at(&cache, &format!("/old/{i}"), 1);
+        }
+        put_file_hash_recorded_at(&cache, "/fresh", now);
+
+        let past = std::time::Instant::now();
+        assert_eq!(cache.prune_file_hashes_until(now, 3, past).unwrap(), 3);
+        assert_eq!(file_hash_paths(&cache).len(), 8, "out of time: one read");
+
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        assert_eq!(cache.prune_file_hashes_until(now, 3, later).unwrap(), 7);
         assert_eq!(file_hash_paths(&cache), ["/fresh"]);
     }
 

@@ -536,6 +536,11 @@ fn gc_metrics(gc: &crate::report::GcStatsPersisted, now: &str) -> Vec<Value> {
             gc.entries_unreclaimable as u64,
         ),
         (
+            "kache.cache.gc.last_run.unreclaimable_bytes",
+            "By",
+            gc.unreclaimable_bytes,
+        ),
+        (
             "kache.cache.gc.last_run.entries_failed",
             "{entry}",
             gc.entries_failed as u64,
@@ -775,6 +780,7 @@ mod tests {
                 entries_recent_prefiltered: 20,
                 entries_pinned: 25,
                 entries_unreclaimable: 42,
+                unreclaimable_bytes: 9_500_000_000,
                 duration_ms: 5801,
                 evict_write_ms: 4200,
                 ..Default::default()
@@ -902,6 +908,7 @@ mod tests {
             ("kache.cache.gc.last_run.bytes_freed", "8373732071"),
             ("kache.cache.gc.last_run.entries_pinned", "25"),
             ("kache.cache.gc.last_run.entries_unreclaimable", "42"),
+            ("kache.cache.gc.last_run.unreclaimable_bytes", "9500000000"),
             ("kache.cache.gc.last_run.entries_failed", "3"),
             ("kache.cache.gc.last_run.entries_locked", "2"),
             ("kache.cache.gc.last_run.entries_busy_snapshot", "1"),
