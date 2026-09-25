@@ -10,6 +10,11 @@
 //!
 //! A size sweep measures those bytes before it evicts and records the total
 //! here, so the automatic triggers can leave them out of size pressure.
+//!
+//! Removals that unlink blobs drop the record without taking `gc.lock`, so a
+//! sweep's publication and a drop serialize on a lock of their own: the
+//! publication counts only measured blobs still in the index, and a drop
+//! that waited for it removes what it wrote.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -29,6 +34,10 @@ struct UnreclaimableRecord {
 
 fn record_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join("gc-unreclaimable.json")
+}
+
+fn record_lock(cache_dir: &Path) -> anyhow::Result<crate::StoreLock> {
+    crate::StoreLock::acquire(&cache_dir.join("gc-unreclaimable.lock"))
 }
 
 pub(crate) fn unix_now_secs() -> u64 {
@@ -59,23 +68,34 @@ pub(crate) fn recorded_unreclaimable(cache_dir: &Path, now: u64) -> u64 {
 /// unlinked blobs, a cleared store, a rewritten blob index. Kept, it would
 /// go on subtracting their bytes from a store that no longer holds them and
 /// hide real pressure until it expired. The next size sweep measures again.
+///
+/// Call it after the removal commits. Waiting for the record lock orders the
+/// drop after any publication already counting the removed blobs.
 pub(crate) fn forget_unreclaimable(cache_dir: &Path) {
+    // Without the lock the record is still dropped: a stale credit costs
+    // more than a lost measurement.
+    let _lock = record_lock(cache_dir).ok();
     let _ = std::fs::remove_file(record_path(cache_dir));
 }
 
-/// Store a size sweep's measurement. The caller holds `gc.lock`. A failed
-/// write only costs the next trigger its correction.
-pub(crate) fn record_unreclaimable(cache_dir: &Path, bytes: u64, now: u64) {
+/// Store a size sweep's measurement. The caller holds `gc.lock`.
+///
+/// `current_bytes` runs under the record lock and returns the measured bytes
+/// still in the index. Returns the bytes written; an error leaves the
+/// record as it was and only costs the next trigger its correction.
+pub(crate) fn record_unreclaimable(
+    cache_dir: &Path,
+    now: u64,
+    current_bytes: impl FnOnce() -> anyhow::Result<u64>,
+) -> anyhow::Result<u64> {
+    let _lock = record_lock(cache_dir)?;
+    let bytes = current_bytes()?;
     let record = UnreclaimableRecord {
         bytes,
         measured_at: now,
     };
-    let written = serde_json::to_vec(&record)
-        .map_err(anyhow::Error::from)
-        .and_then(|json| crate::atomic::atomic_replace(&record_path(cache_dir), &json));
-    if let Err(error) = written {
-        tracing::debug!("gc: could not record unreclaimable bytes: {error:#}");
-    }
+    crate::atomic::atomic_replace(&record_path(cache_dir), &serde_json::to_vec(&record)?)?;
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -116,20 +136,50 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(recorded_unreclaimable(dir.path(), NOW), 0, "no record");
 
-        record_unreclaimable(dir.path(), 4096, NOW);
+        record_unreclaimable(dir.path(), NOW, || Ok(4096)).unwrap();
         assert_eq!(recorded_unreclaimable(dir.path(), NOW), 4096);
         let expiry = NOW + UNRECLAIMABLE_RECORD_TTL.as_secs();
         assert_eq!(recorded_unreclaimable(dir.path(), expiry - 1), 4096);
         assert_eq!(recorded_unreclaimable(dir.path(), expiry), 0);
 
-        record_unreclaimable(dir.path(), 0, NOW);
+        record_unreclaimable(dir.path(), NOW, || Ok(0)).unwrap();
         assert_eq!(recorded_unreclaimable(dir.path(), NOW), 0, "replaced");
 
-        record_unreclaimable(dir.path(), 4096, NOW);
+        record_unreclaimable(dir.path(), NOW, || Ok(4096)).unwrap();
         forget_unreclaimable(dir.path());
         assert_eq!(recorded_unreclaimable(dir.path(), NOW), 0, "forgotten");
 
         std::fs::write(record_path(dir.path()), b"not json").unwrap();
         assert_eq!(recorded_unreclaimable(dir.path(), NOW), 0, "corrupt");
+
+        record_unreclaimable(dir.path(), NOW, || Ok(4096)).unwrap();
+        assert!(record_unreclaimable(dir.path(), NOW, || anyhow::bail!("index")).is_err());
+        assert_eq!(
+            recorded_unreclaimable(dir.path(), NOW),
+            4096,
+            "a failed count keeps the record"
+        );
+    }
+
+    /// A drop that arrives while a publication is counting waits for it and
+    /// removes what it wrote, instead of landing first and being overwritten.
+    #[test]
+    fn a_drop_during_a_publication_removes_what_it_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let (started, drop_started) = std::sync::mpsc::channel();
+        let mut drop = None;
+        record_unreclaimable(dir.path(), NOW, || {
+            let path = dir.path().to_path_buf();
+            drop = Some(std::thread::spawn(move || {
+                started.send(()).unwrap();
+                forget_unreclaimable(&path);
+            }));
+            drop_started.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            Ok(4096)
+        })
+        .unwrap();
+        drop.unwrap().join().unwrap();
+        assert_eq!(recorded_unreclaimable(dir.path(), NOW), 0);
     }
 }

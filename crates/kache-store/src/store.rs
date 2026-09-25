@@ -1473,7 +1473,7 @@ impl StoreLock {
         }
     }
 
-    fn acquire(path: &Path) -> Result<Self> {
+    pub(crate) fn acquire(path: &Path) -> Result<Self> {
         let lock = Self::acquire_current(
             path,
             |file| {
@@ -4267,6 +4267,20 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         Ok(unreclaimable)
     }
 
+    /// Sizes of the blobs in `blobs` still in the index.
+    fn indexed_bytes(&self, blobs: &std::collections::HashMap<String, u64>) -> Result<u64> {
+        let mut size = self
+            .db
+            .prepare_cached("SELECT size FROM blobs WHERE hash = ?1")?;
+        let mut bytes = 0u64;
+        for hash in blobs.keys() {
+            let indexed: Option<i64> =
+                size.query_row(params![hash], |row| row.get(0)).optional()?;
+            bytes += indexed.map_or(0, |size| size.max(0) as u64);
+        }
+        Ok(bytes)
+    }
+
     /// Get the number of entries in the store.
     pub fn entry_count(&self) -> Result<usize> {
         let count: i64 = self
@@ -4828,16 +4842,23 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             GcStats::default()
         };
         // Recorded after the walk: its removals drop any earlier record, and
-        // its refusals add to what was measured.
-        crate::pressure::record_unreclaimable(
+        // its refusals add to what was measured. A concurrent removal may
+        // have unlinked measured blobs since, so only those still indexed
+        // count.
+        stats.unreclaimable_bytes = match crate::pressure::record_unreclaimable(
             &self.config.cache_dir,
-            unreclaimable.bytes(),
             crate::pressure::unix_now_secs(),
-        );
+            || self.indexed_bytes(&unreclaimable.blobs),
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::debug!("gc: could not record unreclaimable bytes: {error:#}");
+                unreclaimable.bytes()
+            }
+        };
         // Every entry is a size-pressure candidate, so each measured one was
         // left in place, whether or not the walk reached it.
         stats.entries_unreclaimable += measured_entries;
-        stats.unreclaimable_bytes = unreclaimable.bytes();
         Ok(stats)
     }
 
@@ -9574,7 +9595,7 @@ mod tests {
         assert_eq!(store.size_pressure().unwrap(), 0, "the record still holds");
 
         let expired = crate::pressure::unix_now_secs() - crate::UNRECLAIMABLE_RECORD_TTL.as_secs();
-        crate::pressure::record_unreclaimable(dir.path(), 1500, expired);
+        crate::pressure::record_unreclaimable(dir.path(), expired, || Ok(1500)).unwrap();
         assert_eq!(store.size_pressure().unwrap(), 1500);
         let stats = store.evict().unwrap();
         assert_eq!(stats.entries_evicted, 1, "{stats:?}");
@@ -9650,7 +9671,10 @@ mod tests {
 
         // A reconcile that rewrites the index drops a fresh record too; one
         // that finds nothing to change keeps it.
-        crate::pressure::record_unreclaimable(dir.path(), 400, crate::pressure::unix_now_secs());
+        crate::pressure::record_unreclaimable(dir.path(), crate::pressure::unix_now_secs(), || {
+            Ok(400)
+        })
+        .unwrap();
         store.reconcile_blob_index().unwrap();
         assert_eq!(store.size_pressure().unwrap(), 0, "nothing rewritten");
         store
@@ -9660,13 +9684,41 @@ mod tests {
         store.reconcile_blob_index().unwrap();
         assert_eq!(store.size_pressure().unwrap(), 400);
 
-        crate::pressure::record_unreclaimable(dir.path(), 400, crate::pressure::unix_now_secs());
+        crate::pressure::record_unreclaimable(dir.path(), crate::pressure::unix_now_secs(), || {
+            Ok(400)
+        })
+        .unwrap();
         store.clear().unwrap();
         assert!(!store.contains(&free));
         assert_eq!(
             crate::pressure::recorded_unreclaimable(dir.path(), crate::pressure::unix_now_secs()),
             0
         );
+    }
+
+    /// A removal between the measurement and its publication unlinks a
+    /// measured blob; the publication must not credit those bytes again.
+    #[test]
+    fn a_publication_counts_only_blobs_still_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 1000;
+        let store = Store::open(&config).unwrap();
+        let removed = put_idle_sized_entry(&store, dir.path(), 1, 1500);
+        link_blobs_outside(&store, dir.path(), &removed);
+        let kept = put_idle_sized_entry(&store, dir.path(), 2, 700);
+        link_blobs_outside(&store, dir.path(), &kept);
+        let measured = store.measure_unreclaimable().unwrap();
+        assert_eq!(measured.bytes(), 2200);
+
+        store.remove_entry(&removed).unwrap();
+        let now = crate::pressure::unix_now_secs();
+        let written = crate::pressure::record_unreclaimable(dir.path(), now, || {
+            store.indexed_bytes(&measured.blobs)
+        })
+        .unwrap();
+        assert_eq!(written, 700);
+        assert_eq!(store.size_pressure().unwrap(), 0);
     }
 
     #[test]
